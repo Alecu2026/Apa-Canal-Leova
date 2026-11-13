@@ -36,7 +36,9 @@ type Detail = {
   lines: Record<string, string | number | null>[] | null;
 };
 
-const MONEY = new Set(["calculat", "datorieAvans", "deAchitat", "apaSuma", "canalSuma", "apaTarif", "canalTarif"]);
+// toate coloanele numerice se afișează cu 2 zecimale (sume și cote), în afară de indexurile contorului și volum (numere întregi / cu puține zecimale)
+const NOT_MONEY = new Set(["citirePrec", "citireCurenta", "consumTotal"]);
+const MONEY = new Set(ONEC_COLUMNS.filter((c) => c.type === "num" && !NOT_MONEY.has(c.key)).map((c) => c.key));
 const PER_PAGE = [50, 100, 200, 500, 1000, PER_PAGE_ALL];
 const ROW_H = 28; // înălțimea fixă a unui rând (necesară virtualizării)
 const HEAD_H = 76; // antetul (titlu + filtru) — rândurile încep sub el

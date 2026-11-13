@@ -20,6 +20,7 @@ import { getMeterSnap } from "@/lib/services/meter-cache";
 import { plainMeter } from "@/lib/meters";
 import { getLocaleFromCookie } from "@/lib/i18n/locale-cookie";
 import PayerIssues from "@/app/components/PayerIssues";
+import PayerOneCData from "@/app/components/PayerOneCData";
 import { listClientIssues } from "@/lib/services/meter-issues";
 import type { IssueRegisterRow } from "@/lib/meter-issues";
 import { dateTag } from "@/lib/i18n/t";
@@ -214,6 +215,12 @@ export default async function PayerDetailPage({
                 </table>
               </div>
             )}
+          </CollapsibleSection>
+
+          <CollapsibleSection id="payer-onec" title={tr("Date din 1C")} defaultOpen={false}>
+            <Suspense fallback={<Skeleton className="h-24" />}>
+              <PayerOneCData clientId={payer.id} />
+            </Suspense>
           </CollapsibleSection>
 
           <CollapsibleSection id="payer-tickets" title={tr("Cereri")} count={tickets.length} defaultOpen={tickets.length > 0}>

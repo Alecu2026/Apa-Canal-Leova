@@ -8,6 +8,7 @@ import { contractDate, contractFilterBounds, contractKey, type ContractExpFilter
 import { metrologyFilterBounds, type MetrologyFilter } from "../metrology";
 import { payerIssueBounds, type PayerIssueFilter } from "../meter-issue-register";
 import { derivePayerInvoices, matchesPayBal } from "../payment-chain";
+import { ONEC_COLUMNS } from "../apa-canal-1c";
 
 const PAGE_SIZE = 50;
 /** Câți plătitori pe pagină alege utilizatorul (?perPage=) — plafonat ca să nu încărcăm mii de rânduri odată. */
@@ -906,4 +907,24 @@ export async function getPayerMonthSlice(month: string): Promise<MonthTuple[]> {
     out.push([inv.clientId, inv.number, inv.status, inv.grandTotal, inv.currency, inv.dueDate ? inv.dueDate.getTime() : null, inv.datoriiAvans ?? 0, inv.prevPaid ?? null, inv.paidAmount ?? null]);
   }
   return out;
+}
+
+/** Un aviz 1C al plătitorului: toate coloanele din Tabelul 1C (ONEC_COLUMNS), cheie → valoare. */
+export type PayerOneCRecord = Record<string, string | number | null> & { id: string; uid: string };
+
+/**
+ * Avizele 1C ale unui plătitor (cele mai noi primele), cu TOATE câmpurile — pentru secțiunea „Date din 1C” de pe fișa lui.
+ * Dublurile din aceeași lună (uid cu „#”) se omit: se folosește primul aviz.
+ */
+export async function getPayerOneCRecords(clientId: string, take = 36): Promise<PayerOneCRecord[]> {
+  if (DEMO) return [];
+  const select: Record<string, true> = { id: true, uid: true };
+  for (const c of ONEC_COLUMNS) select[c.key] = true;
+  const rows = (await prisma.oneCRecord.findMany({
+    where: { clientId },
+    orderBy: { dataDoc: "desc" },
+    take,
+    select: select as Prisma.OneCRecordSelect,
+  })) as unknown as PayerOneCRecord[];
+  return rows.filter((r) => !String(r.uid).includes("#"));
 }

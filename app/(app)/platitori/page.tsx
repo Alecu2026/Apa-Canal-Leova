@@ -9,6 +9,7 @@ import ImportButton from "@/app/components/ImportButton";
 import ApaCanalApiSync from "@/app/components/ApaCanalApiSync";
 import PaymentChainRunner from "@/app/components/PaymentChainRunner";
 import PayerNotifyManager from "@/app/components/PayerNotifyManager";
+import OneCMissingNotice from "@/app/components/OneCMissingNotice";
 import { timed } from "@/lib/timing";
 import { ssrPayerPage } from "@/lib/services/payer-cache";
 import { normalizePerPageClient, sanitizeFilters } from "@/lib/payer-notify";
@@ -68,6 +69,7 @@ export default async function PayersPage({
           {canImport && <ImportButton entity="payers" hideAi />}
         </div>
       </div>
+      <OneCMissingNotice collapsible />
       <PayerNotifyManager
         basePath="/platitori"
         browseOnly
