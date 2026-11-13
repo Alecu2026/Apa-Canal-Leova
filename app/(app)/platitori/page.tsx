@@ -64,6 +64,14 @@ export default async function PayersPage({
           >
             {t("Tabel 1C")}
           </Link>
+          {can(user, "admin") && (
+            <Link
+              href="/settings/mapare-1c"
+              className="tap inline-flex h-9 items-center gap-1.5 rounded-xl border border-[var(--color-line)] px-3 text-sm font-medium text-ink-soft hover:bg-[var(--color-surface-2)]"
+            >
+              {t("Mapare 1C")}
+            </Link>
+          )}
           {can(user, "admin") && <PaymentChainRunner />}
           {canSyncApi && <ApaCanalApiSync />}
           {canImport && <ImportButton entity="payers" hideAi />}

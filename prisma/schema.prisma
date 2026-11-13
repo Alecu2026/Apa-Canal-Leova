@@ -1673,3 +1673,15 @@ model NotifySchedule {
 
   @@index([active, nextRunAt])
 }
+
+// Legăturile dintre variabilele aplicației și câmpurile din răspunsul 1C (avizele de plată), făcute în Setări → Mapare 1C.
+// `appField` = cheia variabilei din aplicație (ex. "client.phone", vezi lib/onec-map.ts), `source` = numele câmpului din răspunsul 1C (ex. "Telefon").
+// Sincronizarea cu 1C copiază valoarea câmpului 1C în variabila aplicației; fără legătură, variabila rămâne necompletată.
+model OneCMapping {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  appField    String   @unique
+  source      String
+  updatedById String?  @db.ObjectId
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}

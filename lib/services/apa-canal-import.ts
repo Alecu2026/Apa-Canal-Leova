@@ -7,6 +7,7 @@ import {
   avizAddress, avizAmounts, avizIssueDate, avizMeter, avizMonth, avizServices, buildOneCRecord, compactCode, nameTokens, num, round2, sameSubscriber, str,
   type OneCAviz, type OneCRecordData,
 } from "../apa-canal-1c";
+import { cleanMappings, isEstimatedReading, mappedValues } from "../onec-map";
 import { prisma } from "../prisma";
 import { bumpClientEpoch, bumpClientSearchEpoch } from "../lookup-memory";
 import { apaCanalDueDate } from "../apa-canal-due";
@@ -77,8 +78,9 @@ export function parseApaCanalBuffer(input: Buffer): ApaCanalRawData {
 export type ExistingClientLite = {
   id: string;
   name: string;
-  /** Telefonul din aplicație — noul 1C nu trimite telefon, deci nu se atinge niciodată. */
+  /** Telefonul și emailul din aplicație — se suprascriu doar când variabila e legată de un câmp 1C (Setări → Mapare 1C) și 1C trimite o valoare. */
   phone?: string | null;
+  email?: string | null;
   /** Instantaneul datelor 1C de pe fișa plătitorului — comparat cu 1C la fiecare sincronizare (oglindire). */
   consumAddress?: string | null;
   meterNumber?: string | null;
@@ -204,6 +206,8 @@ export function buildApaCanalPlan(
     existingInvoices?: Map<string, ExistingInvoiceLite>;
     /** Abonații din luna dinaintea primei luni din răspuns (din Tabelul 1C, doar înregistrările noului 1C) — ca să știm cine a dispărut din prima lună a răspunsului. */
     prevMonth?: { month: string; subs: Map<string, SubInfo> };
+    /** Legăturile variabilă a aplicației → câmp 1C făcute în Setări → Mapare 1C (ex. "client.phone" → "Telefon"). */
+    mappings?: Record<string, string>;
   },
 ): ApaCanalPlan {
   const rows = data
@@ -268,7 +272,7 @@ export function buildApaCanalPlan(
   type ClientChange = { camp: string; api: string; aplicatie: string };
   const mirrorClient = (
     c: ExistingClientLite,
-    v: { name: string; snapshot: { consumAddress: string | null; meterNumber: string | null; meterCurrReading: number | null; grandTotal: number } },
+    v: { name: string; phone?: string | null; email?: string | null; contract?: string | null; snapshot: { consumAddress: string | null; meterNumber: string | null; meterCurrReading: number | null; grandTotal: number; sectorNr?: string | null; estimated?: boolean | null } },
   ): { upd: Prisma.ClientUpdateInput; changes: ClientChange[] } => {
     const upd: Prisma.ClientUpdateInput = {};
     const changes: ClientChange[] = [];
@@ -278,7 +282,31 @@ export function buildApaCanalPlan(
       upd.name = v.name;
       c.name = v.name;
     }
+    if (v.phone && v.phone !== (c.phone ?? null)) {
+      chg("Telefon", v.phone, c.phone);
+      upd.phone = v.phone;
+      c.phone = v.phone;
+    }
+    if (v.email && v.email !== (c.email ?? null)) {
+      chg("Email", v.email, c.email);
+      upd.email = v.email;
+      c.email = v.email;
+    }
+    if (v.contract && !c.apaCanalContract) {
+      chg("Nr. contract", v.contract, null);
+      upd.apaCanalContract = v.contract;
+      c.apaCanalContract = v.contract;
+    }
     const sn = v.snapshot;
+    if (sn.sectorNr && sn.sectorNr !== (c.lastInvoiceSectorNr ?? null)) {
+      chg("Sector", sn.sectorNr, c.lastInvoiceSectorNr);
+      upd.lastInvoiceSectorNr = sn.sectorNr;
+      c.lastInvoiceSectorNr = sn.sectorNr;
+    }
+    if (sn.estimated != null && sn.estimated !== (c.meterReadingEstimated ?? false)) {
+      upd.meterReadingEstimated = sn.estimated;
+      c.meterReadingEstimated = sn.estimated;
+    }
     if (sn.consumAddress && sn.consumAddress !== (c.consumAddress ?? null)) {
       chg("Adresă", sn.consumAddress, c.consumAddress);
       upd.consumAddress = sn.consumAddress;
@@ -356,6 +384,10 @@ export function buildApaCanalPlan(
     const meterNumber = meter?.contor ?? null;
     const meterCurrReadingNum = meter ? meter.curr : null;
     const vol = round2(num(a["Volum"]));
+    // Variabilele legate de utilizator (telefon, sector…): completate doar dacă 1C trimite câmpul legat și are valoare.
+    const mv = mappedValues(a, ctx.mappings);
+    const estimated = mv.readingSource == null ? null : isEstimatedReading(mv.readingSource);
+    const recExtra = { telefon: mv.phone, inn: mv.idno, tipSector: mv.sector, sectorUchastok: mv.sector1c, nrContract: mv.contract, dataInstalare: mv.installDate, sursa: mv.readingSource };
 
     // Numărul facturii: primul candidat liber sau al acestui abonat din aceeași lună.
     let number = "";
@@ -393,13 +425,14 @@ export function buildApaCanalPlan(
         numDiff("Recalcul (MDL)", amounts.recalc, stored.recalculari);
         numDiff("De achitat (MDL)", amounts.deAchitat, stored.grandTotal);
         txt("Adresă consum", consumAddress, stored.consumAddress);
+        txt("Sector", mv.sector, stored.sectorNr);
         if (name && !name.includes("?") && name !== (stored.consumerName ?? null)) diffs.push({ camp: "Nume", api: name, aplicatie: stored.consumerName || "—" });
       }
       // Fișa plătitorului: oglindă 1C (doar de la cea mai nouă factură a lui — o lună veche are date vechi), independent de diferențele facturii.
       const owner = stored?.clientId ? clientById.get(stored.clientId) : undefined;
       let ownerChanges: ClientChange[] = [];
       if (owner && (!owner.lastInvoiceIssueDate || issueDate >= owner.lastInvoiceIssueDate)) {
-        const m = mirrorClient(owner, { name, snapshot: { consumAddress, meterNumber, meterCurrReading: meterCurrReadingNum, grandTotal: amounts.deAchitat } });
+        const m = mirrorClient(owner, { name, phone: mv.phone, email: mv.email, contract: mv.contract, snapshot: { consumAddress, meterNumber, meterCurrReading: meterCurrReadingNum, grandTotal: amounts.deAchitat, sectorNr: mv.sector, estimated } });
         ownerChanges = m.changes;
         if (Object.keys(m.upd).length) clientUpdates.push({ id: owner.id, data: m.upd });
       }
@@ -417,6 +450,8 @@ export function buildApaCanalPlan(
             dueDate: dueDateFrom(stored.issueDate),
             ...(consumAddress ? { consumAddress } : {}),
             ...(name && !name.includes("?") ? { consumerName: name } : {}),
+            ...(mv.sector ? { sectorNr: mv.sector } : {}),
+            ...(estimated != null ? { isEstimatedVolume: estimated } : {}),
             monthlyConsumption: vol > 0 ? [{ label: String(issueDate.getUTCMonth() + 1), value: vol }] : [],
           },
           items: amountsChanged ? buildItems(stored.id, a) : null,
@@ -427,7 +462,7 @@ export function buildApaCanalPlan(
       } else {
         docs.push({ ...docBase, status: "existent" });
       }
-      records.push({ ...buildOneCRecord(a, { uid, invoiceNumber: number }), clientId: stored?.clientId ?? null });
+      records.push({ ...buildOneCRecord(a, { uid, invoiceNumber: number }, recExtra), clientId: stored?.clientId ?? null });
       firstSeen.set(dupKey, { number, clientId: stored?.clientId ?? null });
       markSeen(month, code, { number, clientId: stored?.clientId ?? null, name });
       continue;
@@ -465,7 +500,7 @@ export function buildApaCanalPlan(
           ? {
               meterNumber,
               meterCurrReading: meterCurrReadingNum,
-              meterReadingEstimated: false,
+              meterReadingEstimated: estimated ?? false,
               lastInvoiceStatus: "SENT" as const,
               lastInvoiceGrandTotal: grandTotal,
               lastInvoiceIssueDate: issueDate,
@@ -482,7 +517,7 @@ export function buildApaCanalPlan(
         existing.meterSeries = meterSeries;
         clientBySeries.set(meterSeries, existing);
       }
-      if (newest) Object.assign(upd, mirrorClient(existing, { name, snapshot: { consumAddress, meterNumber, meterCurrReading: meterCurrReadingNum, grandTotal } }).upd);
+      if (newest) Object.assign(upd, mirrorClient(existing, { name, phone: mv.phone, email: mv.email, contract: mv.contract, snapshot: { consumAddress, meterNumber, meterCurrReading: meterCurrReadingNum, grandTotal, sectorNr: mv.sector, estimated } }).upd);
       clientUpdates.push({ id: existing.id, data: upd });
     } else {
       clientId = oid();
@@ -491,19 +526,22 @@ export function buildApaCanalPlan(
         id: clientId,
         userId: ctx.ownerId,
         name,
-        phone: null,
+        phone: mv.phone,
+        email: mv.email,
+        apaCanalContract: mv.contract,
         meterSeries,
         meterNumber,
         meterCurrReading: meterCurrReadingNum,
-        meterReadingEstimated: false,
+        meterReadingEstimated: estimated ?? false,
         consumAddress,
         lastInvoiceStatus: "SENT",
         lastInvoiceGrandTotal: grandTotal,
+        lastInvoiceSectorNr: mv.sector,
         lastInvoiceIssueDate: issueDate,
         apaCanalImport: !meterSeries,
       });
       const created: ExistingClientLite = {
-        id: clientId, name, meterSeries, portalActivatedAt: null, lastInvoiceIssueDate: issueDate, consumAddress, meterNumber, meterCurrReading: meterCurrReadingNum, lastInvoiceGrandTotal: grandTotal,
+        id: clientId, name, phone: mv.phone, email: mv.email, apaCanalContract: mv.contract, meterSeries, portalActivatedAt: null, lastInvoiceIssueDate: issueDate, lastInvoiceSectorNr: mv.sector, consumAddress, meterNumber, meterCurrReading: meterCurrReadingNum, lastInvoiceGrandTotal: grandTotal,
       };
       clientsByNameKey.set(nameKey, [...(clientsByNameKey.get(nameKey) ?? []), created]);
       clientById.set(clientId, created);
@@ -530,7 +568,8 @@ export function buildApaCanalPlan(
       meterNumber,
       meterPrevReading: apiValues.citirePrec,
       meterCurrReading: apiValues.citireCurenta,
-      isEstimatedVolume: false,
+      isEstimatedVolume: estimated ?? false,
+      sectorNr: mv.sector,
       billingPeriodLabel: `${LUNI_RO[issueDate.getUTCMonth()]} ${issueDate.getUTCFullYear()}`,
       recalculari: amounts.recalc,
       penalitati: 0,
@@ -545,7 +584,7 @@ export function buildApaCanalPlan(
       userId: ctx.ownerId,
     });
     itemsToCreate.push(...buildItems(invoiceId, a));
-    records.push({ ...buildOneCRecord(a, { uid, invoiceNumber: number }), clientId });
+    records.push({ ...buildOneCRecord(a, { uid, invoiceNumber: number }, recExtra), clientId });
   }
 
   // „Dispărut din luna următoare = sold zero”. Noul 1C scoate din listă abonații al căror „Total spre plată” e ≤ 0 (verificat pe date reale: în nicio lună nu apare vreunul cu sold ≤ 0,
@@ -766,7 +805,7 @@ export async function importApaCanalBuffer(buf: Buffer, opts: { ownerId: string;
     // celui care i-a importat prima dată — altfel, la o sincronizare pornită de altcineva, toți ar părea "noi" și s-ar dubla.
     prisma.client.findMany({
       select: {
-        id: true, name: true, phone: true, meterSeries: true, portalActivatedAt: true, lastInvoiceIssueDate: true, apaCanalContract: true,
+        id: true, name: true, phone: true, email: true, meterSeries: true, portalActivatedAt: true, lastInvoiceIssueDate: true, apaCanalContract: true,
         consumAddress: true, meterNumber: true, meterCurrReading: true, meterReadingEstimated: true, lastInvoiceGrandTotal: true, lastInvoiceSectorNr: true,
       },
     }),
@@ -795,9 +834,13 @@ export async function importApaCanalBuffer(buf: Buffer, opts: { ownerId: string;
     }
   }
 
+  // Legăturile făcute în Setări → Mapare 1C (variabilă a aplicației → câmp 1C); fără ele, doar câmpurile fixe se completează.
+  const mappings = cleanMappings(Object.fromEntries((await prisma.oneCMapping.findMany({ select: { appField: true, source: true } })).map((m) => [m.appField, m.source])));
+
   const plan = buildApaCanalPlan(data, {
     ownerId: opts.ownerId,
     prevMonth,
+    mappings,
     existingClients,
     existingInvoiceNumbers: new Set(existingInvoices.map((i) => i.number)),
     existingInvoices: new Map(existingInvoices.map((i) => [i.number, i])),

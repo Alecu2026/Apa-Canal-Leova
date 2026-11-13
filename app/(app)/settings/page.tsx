@@ -123,6 +123,13 @@ async function CompanyTab({ user }: { user: CurrentUser }) {
         </div>
         <IconChevronRight className="size-5 text-brand" />
       </Link>
+      <Link href="/settings/mapare-1c" className="card tap flex items-center justify-between p-5 hover:border-brand">
+        <div>
+          <h2 className="text-base font-bold">{t("Mapare 1C")}</h2>
+          <p className="text-sm text-ink-soft">{t("Variabilele aplicației față în față cu câmpurile 1C: ce e legat, ce lipsește și ce funcții depind de ele.")}</p>
+        </div>
+        <IconChevronRight className="size-5 text-brand" />
+      </Link>
       <Link href="/settings/portal-accounts" className="card tap flex items-center justify-between p-5 hover:border-brand">
         <div>
           <h2 className="text-base font-bold">{t("Conturi portal clienți")}</h2>

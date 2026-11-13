@@ -105,6 +105,13 @@ export type OneCAviz = Record<string, unknown>;
 export type OneCRecordData = {
   uid: string;
   nume: string;
+  /** Din variabile legate de utilizator (Setări → Mapare 1C); altfel null. */
+  telefon: string | null;
+  inn: string | null;
+  tipSector: string | null;
+  sectorUchastok: string | null;
+  nrContract: string | null;
+  dataInstalare: string | null;
   contPersonal: string;
   strada: string | null;
   casa: string | null;
@@ -254,7 +261,13 @@ export function avizMeter(a: OneCAviz): { contor: string; sigiliu: string | null
 }
 
 /** Înregistrarea "Tabelul 1C" a unui aviz. `uid` și `invoiceNumber` le stabilește importul (după duplicate / facturile existente). */
-export function buildOneCRecord(a: OneCAviz, ids: { uid: string; invoiceNumber: string | null }): OneCRecordData {
+/** Valorile variabilelor legate de utilizator (Setări → Mapare 1C), care completează câmpurile Tabelului 1C ce nu există în avizul standard. */
+export type OneCRecordExtra = {
+  telefon?: string | null; inn?: string | null; tipSector?: string | null; sectorUchastok?: string | null;
+  nrContract?: string | null; dataInstalare?: string | null; sursa?: string | null;
+};
+
+export function buildOneCRecord(a: OneCAviz, ids: { uid: string; invoiceNumber: string | null }, extra: OneCRecordExtra = {}): OneCRecordData {
   const dataDoc = avizDay(a["Data"]) ?? "";
   const amounts = avizAmounts(a);
   const services = avizServices(a);
@@ -266,10 +279,10 @@ export function buildOneCRecord(a: OneCAviz, ids: { uid: string; invoiceNumber: 
   const contPersonal = compactCode(a["AbonentCod"]);
 
   const meters: OneCMeter[] = meter
-    ? [{ perioada: dataDoc || null, consumator: "", inn: "", contor: meter.contor, dataInstalare: null, sigiliu: meter.sigiliu ?? "", dataScoatere: null, subAbonat: "", subContract: "", subCont: "", subConsumator: "", subContor: "" }]
+    ? [{ perioada: dataDoc || null, consumator: "", inn: extra.inn ?? "", contor: meter.contor, dataInstalare: extra.dataInstalare ?? null, sigiliu: meter.sigiliu ?? "", dataScoatere: null, subAbonat: "", subContract: "", subCont: "", subConsumator: "", subContor: "" }]
     : [];
   const readings: OneCReading[] = meter
-    ? [{ consumator: "", inn: "", contor: meter.contor, sursa: "", citirePrec: meter.prev, dataPrec: null, citire: meter.curr, dataCitire: null, consum: vol, medie: 0, consumSubcontoare: 0 }]
+    ? [{ consumator: "", inn: extra.inn ?? "", contor: meter.contor, sursa: extra.sursa ?? "", citirePrec: meter.prev, dataPrec: null, citire: meter.curr, dataCitire: null, consum: vol, medie: 0, consumSubcontoare: 0 }]
     : [];
   const lines: OneCLine[] = services.map((s) => ({
     consumator: "", inn: "", contor: meter?.contor ?? "", serviciu: s.svc, volum: s.volum, tarif: s.tarif, suma: s.suma, data: dataDoc || null,
@@ -278,6 +291,12 @@ export function buildOneCRecord(a: OneCAviz, ids: { uid: string; invoiceNumber: 
   return {
     uid: ids.uid,
     nume: str(a["Abonent"]),
+    telefon: extra.telefon ?? null,
+    inn: extra.inn ?? null,
+    tipSector: extra.tipSector ?? null,
+    sectorUchastok: extra.sectorUchastok ?? null,
+    nrContract: extra.nrContract ?? null,
+    dataInstalare: extra.dataInstalare ?? null,
     contPersonal,
     strada: orNull(str(a["Strada"])),
     casa: orNull(str(a["Casa"])),
