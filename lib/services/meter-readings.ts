@@ -1,0 +1,469 @@
+import "server-only";
+import type { MeterReading } from "@prisma/client";
+import { prisma } from "../prisma";
+import { DEMO } from "../demo";
+import { getMeterSnap } from "./meter-cache";
+import { logAudit } from "./audit";
+import { listRoutes } from "./meter-route-data";
+import { getMeterDetail } from "../queries/meters";
+import { invalidatePortalClient } from "../portal-cache";
+import { isEstimatedSource } from "../meters";
+import { queueReadingVerification } from "./reading-verify";
+import { getLorawanMap } from "./lorawan-map";
+import { LORAWAN_SOURCE } from "../lorawan";
+import { deleteStored } from "../storage";
+import type { FieldList } from "../meter-routes";
+import {
+  AVG_MIN_READINGS,
+  FAR_METERS,
+  MAX_ADDRESS,
+  MAX_LOC_ACCURACY,
+  MAX_INDEX,
+  checkConsum,
+  currentPeriod,
+  distanceMeters,
+  shiftPeriod,
+  type ConsumAvg,
+  type FieldTuple,
+  type MeterLocationDto,
+  type ReadingDto,
+  type SaveReadingResult,
+} from "../meter-readings";
+
+/**
+ * Citirile lunare din teren (model MeterReading). O citire pe contor și lună; indexul se poate corecta în aceeași lună. Nu modifică facturile
+ * sau datele din 1C — se păstrează doar în baza de date, cu locația și (opțional) poza contorului.
+ */
+
+/** `id` lipsește la plătitorul care trimite citirea din portal (nu e un utilizator al CRM-ului). */
+export type Actor = { id: string | null; name: string };
+
+const OBJECT_ID = /^[0-9a-f]{24}$/i;
+const round3 = (n: number) => Math.round(n * 1000) / 1000;
+const collator = new Intl.Collator("ro", { numeric: true });
+
+export function toReadingDto(r: MeterReading): ReadingDto {
+  return {
+    id: r.id,
+    meterId: r.meterId,
+    contor: r.contor,
+    period: r.period,
+    value: r.value,
+    prevValue: r.prevValue,
+    readAt: r.readAt.toISOString(),
+    lat: r.lat,
+    lng: r.lng,
+    accuracy: r.accuracy,
+    distanceM: r.distanceM,
+    photoUrl: r.photoUrl,
+    userName: r.userName,
+    avgConsum: r.avgConsum,
+  };
+}
+
+/** Cât istoric intră în medie: ultimele 12 luni cu consum real. */
+const AVG_MONTHS = 12;
+
+/**
+ * Consumul mediu lunar al unui contor, din ultimele luni cu consum REAL: istoricul din 1C (fără consumul estimat/calculat) plus citirile din teren
+ * (consum = index − indexul anterior cunoscut). O singură valoare pe lună (citirea din teren completează lunile pe care 1C nu le are încă);
+ * luna `exceptPeriod` (cea în care se citește acum) nu intră — altfel o citire greșită și-ar strica singură media. Null dacă sunt mai puțin de AVG_MIN_READINGS luni.
+ */
+export async function getMeterAverage(meterId: string, exceptPeriod: string = currentPeriod()): Promise<ConsumAvg | null> {
+  if (DEMO) return null;
+  const [detail, field] = await Promise.all([
+    getMeterDetail(meterId, { historyLimit: 40 }).catch(() => null),
+    prisma.meterReading.findMany({
+      where: { meterId, prevValue: { not: null }, period: { not: exceptPeriod } },
+      orderBy: { period: "desc" },
+      take: AVG_MONTHS + 2,
+      select: { period: true, value: true, prevValue: true },
+    }),
+  ]);
+  const byMonth = new Map<string, number>();
+  for (const h of detail?.history ?? []) {
+    const month = (h.currDate ?? h.docDate ?? "").slice(0, 7);
+    if (!/^\d{4}-\d{2}$/.test(month) || month === exceptPeriod || byMonth.has(month)) continue;
+    if (h.consum == null || !Number.isFinite(h.consum) || h.consum < 0) continue;
+    if (h.sursa && /расч|estimat/i.test(h.sursa)) continue; // consum calculat, nu citit: nu arată consumul real
+    byMonth.set(month, h.consum);
+  }
+  for (const f of field) {
+    if (byMonth.has(f.period) || f.prevValue == null || f.value < f.prevValue) continue;
+    byMonth.set(f.period, round3(f.value - f.prevValue));
+  }
+  const last = [...byMonth].sort((a, b) => b[0].localeCompare(a[0])).slice(0, AVG_MONTHS).map((e) => e[1]);
+  if (last.length < AVG_MIN_READINGS) return null;
+  return { avg: round3(last.reduce((s, c) => s + c, 0) / last.length), count: last.length };
+}
+
+/** Citirile din teren ale unui contor (cele mai noi primele). */
+export async function listMeterReadings(meterId: string, limit = 36): Promise<ReadingDto[]> {
+  if (DEMO) return [];
+  const rows = await prisma.meterReading.findMany({ where: { meterId }, orderBy: { period: "desc" }, take: limit });
+  return rows.map(toReadingDto);
+}
+
+/**
+ * Lista pentru persoana care face citirile: contoarele ACTIVE, în ordinea adreselor (ca să se poată merge pe stradă), cu ultimul index cunoscut și
+ * cu citirea de luna aceasta (dacă există). Din lista din memorie + citirile din teren (puține), fără interogări grele.
+ */
+export async function getFieldList(periodArg?: string | null): Promise<FieldList> {
+  // o lună anterioară se poate doar vedea (istoric): citirile ei apar ca „citirea lunii”; fără parametru = luna curentă
+  const nowPeriod = currentPeriod();
+  const period = periodArg && /^\d{4}-(0[1-9]|1[0-2])$/.test(periodArg) && periodArg <= nowPeriod ? periodArg : nowPeriod;
+  if (DEMO) return { period, rows: [], routes: [] };
+  const [snap, lw, recent, locs, routes, openIssues] = await Promise.all([
+    getMeterSnap(),
+    getLorawanMap(),
+    // luna aceasta + cele două dinainte: citirile din teren mai noi decât indexul din 1C
+    prisma.meterReading.findMany({
+      where: { period: { gte: shiftPeriod(period, 2), lte: period } },
+      select: { meterId: true, period: true, value: true, readAt: true, photoUrl: true, userName: true, source: true, distanceM: true, lat: true, lng: true, accuracy: true, avgConsum: true },
+    }),
+    // adresa / locația contoarelor completate din teren (o înregistrare mică pe contor)
+    prisma.meterLocation.findMany({ select: { meterId: true, address: true, lat: true, lng: true, accuracy: true } }),
+    listRoutes(),
+    // neregulile deschise (cea mai nouă pe contor): marcaj în listă
+    prisma.meterIssue.findMany({ where: { resolvedAt: null }, select: { meterId: true, kind: true, reportedAt: true }, orderBy: { reportedAt: "asc" } }),
+  ]);
+  const issueBy = new Map(openIssues.map((i) => [i.meterId, i.kind]));
+  const locBy = new Map(locs.map((l) => [l.meterId, l]));
+  const thisMonth = new Map<string, (typeof recent)[number]>();
+  const lastBefore = new Map<string, (typeof recent)[number]>();
+  for (const r of recent) {
+    if (r.period === period) thisMonth.set(r.meterId, r);
+    else {
+      const prev = lastBefore.get(r.meterId);
+      if (!prev || r.readAt > prev.readAt) lastBefore.set(r.meterId, r);
+    }
+  }
+  // Doar contoarele ACTIVE din 1C: cele scoase nu se citesc, iar rândurile „doar Axioma” (abonați fără niciun contor în 1C — fără adresă, fără index) nu sunt contoare active.
+  const active = snap.rows.filter((r) => !r.removedAt && r.source === "1c");
+  // Contoarele fără adresă (în 1C multe firme n-au) merg la sfârșit: pe teren se parcurg întâi cele cu adresă.
+  active.sort((a, b) => Number(!a._a) - Number(!b._a) || collator.compare(a._a, b._a) || collator.compare(a.contor, b.contor));
+  const rows = active.map((r): FieldTuple => {
+    const cur = thisMonth.get(r.id);
+    const fb = lastBefore.get(r.id);
+    // ultimul index cunoscut: cel mai recent între 1C și o citire din teren
+    const fbDate = fb ? fb.readAt.toISOString().slice(0, 10) : null;
+    const loc = locBy.get(r.id);
+    // 1C câștigă: adresa din teren se folosește doar cât timp 1C n-are una
+    const fieldAddr = !r.address && loc?.address ? loc.address : null;
+    const useField = fb && (!r.currDate || (fbDate ?? "") > r.currDate);
+    // Locația afișată: cea salvată pentru contor; altfel GPS-ul citirii de luna aceasta sau al ultimei citiri (citirile făcute înainte să existe „locația contorului”)
+    const geo = loc?.lat != null && loc.lng != null ? loc : cur?.lat != null && cur.lng != null ? cur : fb?.lat != null && fb.lng != null ? fb : null;
+    return [
+      r.id, r.contor, r.name, r.address || fieldAddr,
+      useField ? fb.value : r.curr, useField ? fbDate : r.currDate,
+      cur ? cur.value : null, cur ? cur.readAt.getTime() : null, cur?.photoUrl ? 1 : 0,
+      cur ? cur.userName : null, cur ? cur.distanceM : null, cur && cur.lat != null && cur.lng != null ? 1 : 0,
+      geo?.lat ?? null, geo?.lng ?? null, fieldAddr ? 1 : 0, geo?.accuracy ?? null,
+      // sectorul din 1C vine odată cu lista de contoare (aceeași versiune, mereu la zi)
+      r.uch, issueBy.get(r.id) ?? null,
+      // citirea lunii a fost trimisă de plătitor din portal
+      cur?.source === "PORTAL" ? 1 : 0,
+      // consumul mediu lunar al contorului la citire (verificarea „peste / sub medie”)
+      cur?.avgConsum ?? null,
+      // ultimul index cunoscut e calculat (estimat) în 1C și nu a fost înlocuit de o citire din teren mai nouă
+      !useField && isEstimatedSource(r.sursa) ? 1 : 0,
+      // contor care transmite automat prin LoRaWAN: nu se citește și nu se editează manual
+      lw.map.has(r.id) ? (cur?.source === LORAWAN_SOURCE ? 2 : 1) : 0,
+    ];
+  });
+  return { period, rows, routes: routes.filter((r) => r.active) };
+}
+
+export type SaveInput = {
+  meterId: string;
+  value: number;
+  lat: number | null;
+  lng: number | null;
+  accuracy: number | null;
+  /** Utilizatorul a confirmat o citire care pare greșită (mai mică decât cea anterioară / salt mare). */
+  confirmed: boolean;
+  /** Adresa contorului scrisă din teren — se păstrează doar dacă 1C n-are adresă pentru acest contor. */
+  address?: string | null;
+  /** Momentul real al citirii (citirile făcute fără internet se trimit mai târziu): luna citirii se socotește după el. Gol = acum. */
+  readAt?: Date | null;
+  /** Vine din coada de pe telefon: o citire mai recentă deja salvată nu se suprascrie cu una mai veche. */
+  fromQueue?: boolean;
+  /** „PORTAL”: citirea o trimite plătitorul din portal — nu suprascrie o citire făcută de cititor în aceeași lună. „LORAWAN”: citirea vine automat de la contor (lib/services/lorawan.ts). */
+  source?: "PORTAL" | "LORAWAN";
+  /** Doar verifică (aceleași reguli ca la salvare: index mai mic, consum neobișnuit, citire a cititorului…) fără să scrie nimic — vezi `checkReading`. */
+  dryRun?: boolean;
+  /** Plătitorul a confirmat deja citirea din email: se marchează verificată și nu se mai trimite emailul de verificare. */
+  verified?: boolean;
+};
+
+/** O citire din coada offline nu poate avea ora în viitor și nici să fie mai veche de atât. */
+export const QUEUE_MAX_AGE_DAYS = 40;
+
+/** Mesajul pentru o încercare de a citi / corecta manual un contor LoRaWAN. */
+export const LORAWAN_LOCKED_ERROR = "Contorul transmite automat prin LoRaWAN: indexul nu se poate citi sau modifica manual.";
+
+type DryRunOk = { ok: true; dryRun: true };
+
+/** Salvează (sau corectează) citirea de luna aceasta a unui contor. */
+export async function saveReading(actor: Actor, input: SaveInput): Promise<SaveReadingResult> {
+  return (await saveReadingImpl(actor, { ...input, dryRun: false })) as SaveReadingResult;
+}
+
+/** Verifică o citire cu aceleași reguli ca `saveReading`, fără să scrie: întoarce eroarea / cererea de confirmare pe care ar da-o salvarea, sau ok. */
+export async function checkReading(actor: Actor, input: SaveInput): Promise<Exclude<SaveReadingResult, { ok: true }> | DryRunOk> {
+  return (await saveReadingImpl(actor, { ...input, dryRun: true })) as Exclude<SaveReadingResult, { ok: true }> | DryRunOk;
+}
+
+async function saveReadingImpl(actor: Actor, input: SaveInput): Promise<SaveReadingResult | DryRunOk> {
+  if (DEMO) return { ok: false, error: "Mod demo." };
+  const { value } = input;
+  if (!Number.isFinite(value) || value < 0 || value > MAX_INDEX) return { ok: false, error: "Index invalid." };
+  const snap = await getMeterSnap();
+  const row = snap.rows.find((r) => r.id === input.meterId);
+  if (!row) return { ok: false, error: "Contorul nu există în lista curentă." };
+  if (row.removedAt) return { ok: false, error: "Contorul este scos din uz." };
+  // contoarele care transmit prin LoRaWAN nu se citesc și nu se corectează manual (nici de cititor, nici de plătitor): indexul vine singur
+  if (input.source !== LORAWAN_SOURCE && (await getLorawanMap()).map.has(input.meterId)) return { ok: false, error: LORAWAN_LOCKED_ERROR };
+
+  const now = new Date();
+  let takenAt = now;
+  if (input.readAt) {
+    const t = input.readAt.getTime();
+    if (!Number.isFinite(t) || t > now.getTime() + 10 * 60_000) return { ok: false, error: "Ora citirii e în viitor (verifică ceasul telefonului)." };
+    if (t < now.getTime() - QUEUE_MAX_AGE_DAYS * 86_400_000) return { ok: false, error: `Citirea e mai veche de ${QUEUE_MAX_AGE_DAYS} de zile și nu se mai poate trimite.` };
+    takenAt = input.readAt;
+  }
+  const period = currentPeriod(takenAt);
+  // Indexul anterior: cel mai recent între 1C și o citire din teren dintr-o lună anterioară.
+  const lastField = await prisma.meterReading.findFirst({
+    where: { meterId: input.meterId, period: { not: period } },
+    orderBy: { readAt: "desc" },
+    select: { value: true, readAt: true },
+  });
+  let prev: number | null = row.curr;
+  let prevDate = row.currDate;
+  if (lastField) {
+    const fd = lastField.readAt.toISOString().slice(0, 10);
+    if (!prevDate || fd > prevDate) {
+      prev = lastField.value;
+      prevDate = fd;
+    }
+  }
+  const v = round3(value);
+  // citirea existentă a lunii (dacă e): regula portalului / LoRaWAN de mai jos și emailul de verificare către titular, la o modificare
+  const cur = await prisma.meterReading.findUnique({ where: { meterId_period: { meterId: input.meterId, period } }, select: { source: true, value: true, avgConsum: true } });
+  // media lunară a contorului: baza verificării „peste / sub medie” și se păstrează pe citire (pentru semnalarea ei în liste); la actualizarea zilnică LoRaWAN se păstrează media deja calculată
+  const avg = prev == null ? null : input.source === LORAWAN_SOURCE && cur?.avgConsum != null ? { avg: cur.avgConsum, count: 0 } : await getMeterAverage(input.meterId, period).catch(() => null);
+  if (!input.confirmed && prev != null) {
+    if (v < prev) return { ok: false, error: "Indexul este mai mic decât cel anterior.", confirm: "lower" };
+    const chk = checkConsum(round3(v - prev), avg?.avg);
+    // „Prea mic” e doar un semnal (casă nelocuită, plecați): nu blochează citirea din portal sau din coada offline, unde nu e nimeni să confirme; rămâne semnalată în liste
+    if (chk?.kind === "high") return { ok: false, error: "Consum neobișnuit de mare.", confirm: "high", ...(avg && chk.pct != null ? { avg, pct: chk.pct } : {}) };
+    if (chk?.kind === "low" && !input.fromQueue && input.source !== "PORTAL") return { ok: false, error: "Consum neobișnuit de mic față de medie.", confirm: "low", ...(avg && chk.pct != null ? { avg, pct: chk.pct } : {}) };
+  }
+
+  const okGeo = input.lat != null && input.lng != null && Math.abs(input.lat) <= 90 && Math.abs(input.lng) <= 180;
+  const lat = okGeo ? input.lat : null;
+  const lng = okGeo ? input.lng : null;
+  const accuracy = okGeo && input.accuracy != null && input.accuracy >= 0 ? Math.round(input.accuracy) : null;
+  let distanceM: number | null = null;
+  if (lat != null && lng != null) {
+    const lastLoc = await prisma.meterReading.findFirst({
+      where: { meterId: input.meterId, period: { not: period }, lat: { not: null }, lng: { not: null } },
+      orderBy: { readAt: "desc" },
+      select: { lat: true, lng: true },
+    });
+    if (lastLoc?.lat != null && lastLoc.lng != null) distanceM = Math.round(distanceMeters(lat, lng, lastLoc.lat, lastLoc.lng));
+  }
+
+  // plătitorul își poate corecta propria citire din portal, dar nu o citire făcută de cititor / operator
+  if (input.source === "PORTAL" && cur && cur.source !== "PORTAL") return { ok: false, error: "Pentru luna aceasta citirea a fost deja înregistrată de cititor." };
+  // citirea automată nu înlocuiește una făcută de un cititor / operator în aceeași lună
+  if (input.source === LORAWAN_SOURCE && cur && cur.source == null) return { ok: false, error: "Pentru luna aceasta citirea a fost deja înregistrată de cititor." };
+  const changed = !!cur && cur.value !== v;
+  if (input.dryRun) return { ok: true, dryRun: true };
+  const data = {
+    contor: row.contor,
+    clientId: row.clientId,
+    value: v,
+    prevValue: prev,
+    readAt: takenAt,
+    lat,
+    lng,
+    accuracy,
+    distanceM,
+    userId: actor.id,
+    userName: actor.name,
+    // o citire din teren care o înlocuiește pe cea din portal șterge marcajul „PORTAL”
+    source: input.source ?? null,
+    avgConsum: avg ? avg.avg : null,
+    // un index schimbat anulează confirmarea / contestarea de dinainte (se cere o verificare nouă)
+    ...(input.verified ? { verifiedAt: new Date(), disputedAt: null, disputeNote: null } : changed ? { verifiedAt: null, disputedAt: null, disputeNote: null } : {}),
+  };
+  if (input.fromQueue) {
+    const existing = await prisma.meterReading.findUnique({ where: { meterId_period: { meterId: input.meterId, period } }, select: { readAt: true, value: true, userName: true } });
+    if (existing && existing.readAt.getTime() > takenAt.getTime() + 1000) {
+      return { ok: false, error: `Pentru acest contor există deja o citire mai recentă: ${existing.value} m³, de ${existing.userName}. Citirea de pe telefon (${v} m³) nu a fost aplicată.` };
+    }
+  }
+  const saved = await prisma.meterReading.upsert({
+    where: { meterId_period: { meterId: input.meterId, period } },
+    create: { meterId: input.meterId, period, ...data },
+    update: data,
+  });
+  const location = await updateMeterLocation(actor, row, { address: input.address ?? null, lat, lng, accuracy, fillOnly: input.source === "PORTAL" });
+  invalidatePortalClient(row.clientId); // plătitorul vede imediat citirea în portal
+  // email de verificare către titular: citire nouă din portal, sau index schimbat (de plătitor în portal / de un angajat peste citirea trimisă de plătitor)
+  const ownerNotice = !!row.clientId && !input.verified && input.source !== LORAWAN_SOURCE && (cur ? changed && (input.source === "PORTAL" || cur.source === "PORTAL") : input.source === "PORTAL");
+  let ownerEmailTo: string | null = null;
+  if (ownerNotice && row.clientId) {
+    ownerEmailTo = await queueReadingVerification({
+      readingId: saved.id,
+      clientId: row.clientId,
+      contor: row.contor,
+      address: row.address,
+      period,
+      value: saved.value,
+      prevValue: saved.prevValue,
+      oldValue: cur ? cur.value : null,
+      readAt: saved.readAt,
+      byClient: input.source === "PORTAL",
+    });
+  }
+  return { ok: true, reading: toReadingDto(saved), location, ownerEmailTo };
+}
+
+/**
+ * Salvează adresa scrisă din teren (doar dacă 1C n-are adresă) și locația GPS a contorului: se ia la prima citire cu locație, iar mai târziu doar dacă e mai precisă
+ * (locația unei singure citiri proaste nu strică poziția contorului; fiecare citire își păstrează oricum propria locație).
+ */
+async function updateMeterLocation(
+  actor: Actor,
+  row: { id: string; contor: string; address: string | null },
+  input: { address: string | null; lat: number | null; lng: number | null; accuracy: number | null; /** Citirea vine de la plătitor (telefonul lui nu e neapărat lângă contor): completează locația doar dacă contorul n-are niciuna, nu o înlocuiește pe cea salvată de un cititor. */ fillOnly?: boolean },
+): Promise<MeterLocationDto> {
+  const cur = await prisma.meterLocation.findUnique({ where: { meterId: row.id } });
+  const addr = (input.address ?? "").replace(/\s+/g, " ").trim().slice(0, MAX_ADDRESS) || null;
+  const data: { address?: string; lat?: number; lng?: number; accuracy?: number | null } = {};
+  if (addr && !row.address && addr !== (cur?.address ?? null)) data.address = addr;
+  if (input.lat != null && input.lng != null && (input.accuracy == null || input.accuracy <= MAX_LOC_ACCURACY)) {
+    const better = cur?.lat == null || cur.lng == null || (!input.fillOnly && input.accuracy != null && (cur.accuracy == null || input.accuracy <= cur.accuracy));
+    if (better) {
+      data.lat = input.lat;
+      data.lng = input.lng;
+      data.accuracy = input.accuracy;
+    }
+  }
+  let next = cur;
+  if (Object.keys(data).length) {
+    next = await prisma.meterLocation.upsert({
+      where: { meterId: row.id },
+      create: { meterId: row.id, contor: row.contor, userId: actor.id ?? undefined, userName: actor.name, ...data },
+      update: { userId: actor.id ?? undefined, userName: actor.name, ...data },
+    });
+  }
+  const fieldAddr = !row.address && next?.address ? next.address : null;
+  return { address: row.address || fieldAddr, lat: next?.lat ?? null, lng: next?.lng ?? null, accuracy: next?.accuracy ?? null, addrField: !!fieldAddr };
+}
+
+/** Pune poza unei citiri; întoarce poza veche (de șters din stocare), sau null dacă citirea nu există. */
+export async function setReadingPhoto(readingId: string, url: string, name: string): Promise<{ oldUrl: string | null } | null> {
+  if (!OBJECT_ID.test(readingId)) return null;
+  const cur = await prisma.meterReading.findUnique({ where: { id: readingId }, select: { photoUrl: true } });
+  if (!cur) return null;
+  await prisma.meterReading.update({ where: { id: readingId }, data: { photoUrl: url, photoName: name } });
+  return { oldUrl: cur.photoUrl };
+}
+
+/** Citirea cu id-ul dat (pentru verificări înainte de încărcarea pozei). */
+export async function getReading(readingId: string): Promise<MeterReading | null> {
+  if (!OBJECT_ID.test(readingId)) return null;
+  return prisma.meterReading.findUnique({ where: { id: readingId } });
+}
+
+export { FAR_METERS };
+
+export type AuditUser = { id: string; name: string; role: string; isSuperAdmin?: boolean };
+
+/** Salvează citirea și o trece în Audit Logs (folosit de acțiunea din formular și de sincronizarea cozii offline). */
+export async function saveReadingLogged(user: AuditUser, input: SaveInput): Promise<SaveReadingResult> {
+  const res = await saveReading({ id: user.id, name: user.name }, input);
+  if (res.ok) {
+    const r = res.reading;
+    const consum = r.prevValue != null ? Math.round((r.value - r.prevValue) * 1000) / 1000 : null;
+    await logAudit(
+      { id: user.id, name: user.name, role: user.role, isSuperAdmin: user.isSuperAdmin },
+      {
+        action: "meter.reading",
+        module: "Meters",
+        objectId: input.meterId,
+        objectName: r.contor,
+        oldValue: r.prevValue != null ? `${r.prevValue} m³` : null,
+        newValue: `${r.value} m³`,
+        details: {
+          extra: [
+            { label: "Perioada", value: r.period },
+            ...(consum != null ? [{ label: "Consum", value: `${consum} m³` }] : []),
+            ...(r.lat != null && r.lng != null ? [{ label: "Locație citire", value: `${r.lat.toFixed(5)}, ${r.lng.toFixed(5)}${r.accuracy != null ? ` (±${Math.round(r.accuracy)} m)` : ""}` }] : [{ label: "Locație citire", value: "fără locație" }]),
+            ...(r.distanceM != null ? [{ label: "Distanță față de citirea anterioară", value: `${r.distanceM} m` }] : []),
+            ...(res.location.addrField && res.location.address ? [{ label: "Adresă scrisă din teren", value: res.location.address }] : []),
+            ...(input.fromQueue ? [{ label: "Trimisă din coada offline", value: `citită la ${takenAtLabel(r.readAt)}` }] : []),
+          ],
+        },
+      },
+    );
+  }
+  return res;
+}
+
+/** Câte citiri se pot șterge dintr-o singură acțiune. */
+export const MAX_DELETE_READINGS = 3000;
+
+export type DeleteReadingsResult = { ok: true; deleted: number; skipped: number; sent1c: number } | { ok: false; error: string };
+
+/**
+ * Șterge citirile unei luni (implicit cea curentă; sau o lună anterioară, din istoric) ale contoarelor date (citiri de test, trimise greșit din portal sau de cititor). Ștergerea elimină citirea din CRM și poza ei de pe disc; contorul redevine „necitit”.
+ * Citirile automate LoRaWAN nu se șterg (ar fi aduse la loc la următoarea extragere). Ce a fost deja trimis către 1C rămâne în 1C: numărul lor se întoarce, ca să fie corectat acolo.
+ * Fiecare ștergere intră în Audit Logs.
+ */
+export async function deleteReadings(user: AuditUser, meterIds: string[], periodArg?: string | null): Promise<DeleteReadingsResult> {
+  if (DEMO) return { ok: false, error: "Mod demo." };
+  const ids = [...new Set(meterIds.filter((s) => typeof s === "string" && s.length > 0 && s.length <= 300))];
+  if (ids.length === 0) return { ok: false, error: "Nicio citire aleasă." };
+  if (ids.length > MAX_DELETE_READINGS) return { ok: false, error: "Prea multe citiri odată. Restrânge filtrele și repetă." };
+  const nowPeriod = currentPeriod();
+  const period = periodArg && /^\d{4}-(0[1-9]|1[0-2])$/.test(periodArg) && periodArg <= nowPeriod ? periodArg : nowPeriod;
+  const found = await prisma.meterReading.findMany({ where: { period, meterId: { in: ids } } });
+  const rows = found.filter((r) => r.source !== LORAWAN_SOURCE);
+  const skipped = ids.length - rows.length;
+  if (rows.length === 0) return { ok: false, error: "Nu există citiri de șters pentru contoarele alese (au fost șterse deja sau sunt automate LoRaWAN)." };
+  await prisma.meterReading.deleteMany({ where: { id: { in: rows.map((r) => r.id) } } });
+  // pozele de pe disc și plătitorii care văd citirea în portal
+  await Promise.all(rows.map((r) => (r.photoUrl ? deleteStored(r.photoUrl).catch(() => {}) : Promise.resolve())));
+  for (const c of new Set(rows.map((r) => r.clientId))) invalidatePortalClient(c);
+  const sent1c = rows.filter((r) => r.sent1cAt != null).length;
+  const one = rows.length === 1 ? rows[0] : null;
+  await logAudit(
+    { id: user.id, name: user.name, role: user.role, isSuperAdmin: user.isSuperAdmin },
+    {
+      action: "meter.reading_delete",
+      module: "Meters",
+      objectId: one ? one.meterId : null,
+      objectName: one ? one.contor : `${rows.length} citiri`,
+      oldValue: one ? `${one.value} m³` : null,
+      newValue: null,
+      details: {
+        extra: [
+          { label: "Perioada", value: period },
+          { label: "Citiri șterse", value: String(rows.length) },
+          ...(sent1c ? [{ label: "Deja trimise către 1C", value: String(sent1c) }] : []),
+          ...rows.slice(0, 40).map((r) => ({ label: r.contor, value: `${r.value} m³ · ${r.source === "PORTAL" ? "portal" : "cititor"} · ${r.userName}` })),
+          ...(rows.length > 40 ? [{ label: "…", value: `încă ${rows.length - 40}` }] : []),
+        ],
+      },
+    },
+  );
+  return { ok: true, deleted: rows.length, skipped, sent1c };
+}
+
+const takenAtLabel = (iso: string) => new Date(iso).toLocaleString("ro-RO", { timeZone: "Europe/Bucharest" });

@@ -1,0 +1,47 @@
+// Contoarele plătitorului în portal: tipuri + regulile partajate între server și formular (fără server-only).
+
+import type { IssueKind } from "./meter-issues";
+
+/** Neregulile pe care le poate raporta un plătitor (fraudă / contor inaccesibil sunt constatări ale personalului, nu ale plătitorului). */
+export const PORTAL_ISSUE_KINDS: IssueKind[] = ["DEFECT", "LEAK", "SEAL", "UNREADABLE", "REVERSE", "OTHER"];
+
+export type PortalReadingDto = {
+  id: string;
+  period: string;
+  value: number;
+  /** Consumul față de indexul anterior (m³), dacă se cunoaște. */
+  consum: number | null;
+  readAt: string;
+  photoUrl: string | null;
+  /** „PORTAL” = trimisă de plătitor; „FIELD” = citită de cititor; „LORAWAN” = primită automat de la contor. */
+  source: "PORTAL" | "FIELD" | "LORAWAN";
+};
+
+export type PortalMeterDto = {
+  id: string;
+  contor: string;
+  address: string | null;
+  /** Consumatorul / sub-abonatul de la acest contor (din 1C), când ajută la deosebirea contoarelor. */
+  consumer: string | null;
+  /** Ultimul index cunoscut (1C sau o citire anterioară) și data lui. */
+  lastIndex: number | null;
+  lastDate: string | null;
+  /** Citirea lunii curente, dacă există (a plătitorului sau a cititorului). */
+  thisMonth: PortalReadingDto | null;
+  /** Neregulile deschise (încă nerezolvate de personal). */
+  openIssues: { kind: IssueKind; note: string | null; reportedAt: string }[];
+  /** Citirile ultimelor luni (cele mai noi primele), fără luna curentă. */
+  history: PortalReadingDto[];
+  /** Contorul transmite automat prin LoRaWAN: plătitorul nu trimite indexul (nu se poate modifica manual). */
+  auto: boolean;
+  /** Citire trimisă, în așteptarea confirmării din email: nu e încă înregistrată (nu apare ca citit). */
+  pending: { value: number; submittedAt: string; expiresAt: string; emailsSent: number } | null;
+  /** Scadența următoarei verificări metrologice („YYYY-MM-DD”, ultima verificare + 5 ani); null = necunoscută. */
+  metroDue: string | null;
+};
+
+export type PortalReadingResult =
+  /** Citirea NU e încă înregistrată: a plecat un email de confirmare la `verifyEmail` (adresa mascată), iar citirea contează abia după ce plătitorul o confirmă. */
+  | { ok: true; pending: true; value: number; verifyEmail: string; /** starea contorului (neregula) a fost transmisă personalului imediat, fără să aștepte confirmarea citirii */ issueSaved?: boolean; issueError?: string }
+  /** Plătitorul nu primește avertismentul „prea mic” (lipsa de consum e normală: plecat, casă nelocuită), doar „prea mare”; `avg`/`pct` explică avertismentul față de medie. */
+  | { ok: false; error: string; confirm?: "lower" | "high"; avg?: { avg: number; count: number }; pct?: number };

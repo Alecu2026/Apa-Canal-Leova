@@ -1,0 +1,349 @@
+"use client";
+
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { resendPortalConfirmationAction, submitPortalReadingAction } from "@/app/actions/portal-meters";
+import { ISSUE_LABELS } from "@/lib/meter-issues";
+import { PORTAL_ISSUE_KINDS, type PortalMeterDto } from "@/lib/portal-meters";
+import { JUMP_CONFIRM_M3, parseIndex, sanitizeIndexInput } from "@/lib/meter-readings";
+import { optimizeImage } from "@/lib/image-optimize";
+import { useLocale, useT } from "@/lib/i18n/context";
+import { dateTag } from "@/lib/i18n/t";
+import { IconChevronDown } from "./icons";
+import ContractExpiry from "./ContractExpiry";
+import { daysUntil } from "@/lib/contract-expiry";
+
+const inp = "h-11 w-full rounded-xl border border-[var(--color-line)] bg-[var(--color-surface-2)] px-3 text-sm outline-none focus:border-brand";
+const nf = (n: number) => String(Math.round(n * 1000) / 1000).replace(".", ",");
+
+type Geo = { lat: number; lng: number; accuracy: number };
+/** Locația curentă (cere permisiunea browserului dacă n-a fost dată); null dacă e refuzată / indisponibilă / durează prea mult. */
+function currentGeo(): Promise<Geo | null> {
+  return new Promise((resolve) => {
+    if (typeof navigator === "undefined" || !navigator.geolocation) return resolve(null);
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, accuracy: p.coords.accuracy }),
+      () => resolve(null),
+      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 60_000 },
+    );
+  });
+}
+
+/**
+ * „Contoarele mele” din cabinetul personal: un dropdown cu contoarele plătitorului; pentru cel ales — ultimul index, citirea lunii (dacă există) și formularul de trimitere:
+ * indexul (m³), poza contorului și starea contorului. Plătitorul își poate corecta citirea din portal în aceeași lună; o citire făcută de cititor nu se mai schimbă de aici.
+ */
+export default function PortalMeters({ meters, period }: { meters: PortalMeterDto[]; period: string }) {
+  const t = useT();
+  const router = useRouter();
+  const tag = dateTag(useLocale());
+  const [sel, setSel] = useState(meters[0]?.id ?? "");
+  // secțiunea se deschide singură cât timp mai sunt contoare necitite, dar nu se mai închide de la sine după ce trimiți o citire
+  const [open, setOpen] = useState(() => meters.some((x) => !x.thisMonth));
+  const m = useMemo(() => meters.find((x) => x.id === sel) ?? meters[0], [meters, sel]);
+  const multi = meters.length > 1;
+  /** Următorul contor fără citire în luna aceasta (altul decât cel ales). */
+  const nextUnread = meters.find((x) => !x.thisMonth && x.id !== (meters.find((y) => y.id === sel) ?? meters[0])?.id) ?? null;
+
+  const [value, setValue] = useState("");
+  const [kind, setKind] = useState("");
+  const [note, setNote] = useState("");
+  const [photo, setPhoto] = useState<File | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<null | "lower" | "high">(null);
+  /** Media lunară a contorului și abaterea în % — explică avertismentul „prea mare”, când există destul istoric. */
+  const [confirmAvg, setConfirmAvg] = useState<{ avg: number; pct: number } | null>(null);
+  const [pending, setPending] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const [geoState, setGeoState] = useState<"idle" | "asking" | "ok" | "off">("idle");
+  const geoRef = useRef<Geo | null>(null);
+  const [resending, setResending] = useState(false);
+
+  async function askLocation() {
+    setGeoState("asking");
+    const g = await currentGeo();
+    geoRef.current = g;
+    setGeoState(g ? "ok" : "off");
+    return g;
+  }
+
+  // la schimbarea contorului formularul pornește de la zero (cu indexul trimis deja din portal, dacă există)
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- inițializare / resetare declanșată de schimbarea dependențelor (nu se poate deriva în randare)
+    setValue(m?.thisMonth?.source === "PORTAL" ? String(Math.trunc(m.thisMonth.value)) : "");
+    setKind(""); setNote(""); setPhoto(null); setPreview(null); setConfirm(null); setMsg(null); setGeoState("idle"); geoRef.current = null;
+    if (fileRef.current) fileRef.current.value = "";
+  }, [m?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => () => { if (preview) URL.revokeObjectURL(preview); }, [preview]);
+
+  if (!m) return null;
+  const doneByField = m.thisMonth && m.thisMonth.source === "FIELD";
+  const missing = meters.filter((x) => !x.thisMonth).length;
+  const fmtDay = (iso: string | null) => (iso ? new Date(iso.length === 10 ? `${iso}T12:00:00` : iso).toLocaleDateString(tag, { timeZone: "Europe/Bucharest" }) : "");
+  const periodLabel = new Date(`${period}-15T12:00:00`).toLocaleDateString(tag, { month: "long", year: "numeric" });
+
+  async function submit(confirmed: boolean) {
+    const v = parseIndex(value);
+    if (v == null) { setMsg({ ok: false, text: t("Index invalid. Scrie un număr întreg (m³), fără virgulă, ex. 1234.") }); return; }
+    if (!photo) { setMsg({ ok: false, text: t("Poza contorului este obligatorie: fotografiază cadranul cu indexul.") }); return; }
+    setPending(true); setMsg(null);
+    try {
+      const geo = geoRef.current ?? (await askLocation());
+      const fd = new FormData();
+      fd.set("meterId", m.id);
+      fd.set("value", value);
+      if (confirmed) fd.set("confirmed", "1");
+      fd.set("issueKind", kind);
+      fd.set("issueNote", note);
+      fd.set("photo", await optimizeImage(photo));
+      if (geo) { fd.set("lat", String(geo.lat)); fd.set("lng", String(geo.lng)); fd.set("accuracy", String(geo.accuracy)); }
+      const res = await submitPortalReadingAction(fd);
+      if (!res.ok) {
+        if (res.confirm) {
+          setConfirm(res.confirm);
+          setConfirmAvg(res.avg && res.pct != null ? { avg: res.avg.avg, pct: res.pct } : null);
+        } else setMsg({ ok: false, text: t(res.error) });
+        return;
+      }
+      setConfirm(null);
+      setPhoto(null); setPreview(null); if (fileRef.current) fileRef.current.value = "";
+      const text = res.verifyEmail
+        ? t("Citirea {value} m³ NU este încă înregistrată. Ți-am trimis un email la {email}: apasă „Confirm citirea” din el ca să fie trimisă.", { value: nf(res.value), email: res.verifyEmail })
+        : t("Citirea {value} m³ NU este încă înregistrată: confirm-o din emailul primit.", { value: nf(res.value) });
+      const full = res.issueError ? `${text} ${t("Starea contorului nu s-a salvat: {error}", { error: t(res.issueError) })}` : res.issueSaved ? `${text} ${t("Starea contorului a fost transmisă.")}` : text;
+      setMsg({ ok: !res.issueError, text: multi ? `${t("Contor")} ${m.contor}: ${full}` : full });
+      router.refresh();
+    } catch {
+      setMsg({ ok: false, text: t("A apărut o eroare. Încearcă din nou.") });
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function resend() {
+    if (resending) return;
+    setResending(true);
+    try {
+      const r = await resendPortalConfirmationAction(m.id);
+      setMsg(r.ok ? { ok: true, text: t("Am retrimis emailul de confirmare la {email}.", { email: r.verifyEmail }) } : { ok: false, text: t(r.error) });
+      router.refresh();
+    } catch {
+      setMsg({ ok: false, text: t("A apărut o eroare. Încearcă din nou.") });
+    } finally {
+      setResending(false);
+    }
+  }
+
+  return (
+    <details open={open} onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)} className="card group p-0">
+      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 p-4">
+        <span className="text-sm font-semibold">
+          {t("Contoarele mele")} <span className="font-normal text-ink-soft">({meters.length})</span>
+          {missing > 0 && <span className="ml-2 rounded-full bg-st-progress/12 px-2 py-0.5 text-[11px] font-medium text-st-progress">{t("de citit luna aceasta: {n}", { n: missing })}</span>}
+        </span>
+        <IconChevronDown className="size-4 text-ink-soft transition-transform group-open:rotate-180" />
+      </summary>
+
+      <div className="flex flex-col gap-3 border-t border-[var(--color-line)] p-4">
+        {multi && (
+          <div role="radiogroup" aria-label={t("Alege contorul")} className="flex flex-col gap-2">
+            <p className="text-xs font-semibold text-ink-soft">{t("Ai {n} contoare — alege contorul pentru care trimiți indexul", { n: meters.length })}</p>
+            {meters.map((x, i) => {
+              const on = x.id === m.id;
+              return (
+                <button
+                  key={x.id}
+                  type="button"
+                  role="radio"
+                  aria-checked={on}
+                  onClick={() => setSel(x.id)}
+                  className={`tap flex w-full cursor-pointer items-center gap-3 rounded-xl border px-3 py-2.5 text-left ${on ? "border-brand bg-brand-soft/60 ring-1 ring-brand" : "border-[var(--color-line)] bg-[var(--color-surface)] hover:bg-brand-soft/30"}`}
+                >
+                  <span className={`grid size-5 shrink-0 place-items-center rounded-full border-2 ${on ? "border-brand" : "border-[var(--color-line)]"}`} aria-hidden>
+                    {on && <span className="size-2.5 rounded-full bg-brand" />}
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block text-sm font-semibold">{t("Contor")} {x.contor} <span className="text-xs font-normal text-ink-soft">({i + 1}/{meters.length})</span></span>
+                    {x.address && <span className="block truncate text-xs text-ink-soft">🏠 {x.address}</span>}
+                    {x.consumer && <span className="block truncate text-[11px] text-ink-soft">{x.consumer}</span>}
+                  </span>
+                  {x.thisMonth ? (
+                    <span className="shrink-0 rounded-full bg-st-done/15 px-2 py-0.5 text-[11px] font-semibold text-st-done">✓ {nf(x.thisMonth.value)} m³</span>
+                  ) : (
+                    <span className="shrink-0 rounded-full bg-st-progress/15 px-2 py-0.5 text-[11px] font-semibold text-st-progress">{t("de citit")}</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+        <div className="rounded-xl border border-brand/40 bg-brand-soft/30 px-3 py-2" data-selected-meter="">
+          <p className="text-[11px] text-ink-soft">{multi ? t("Contorul ales ({i} din {n})", { i: meters.findIndex((x) => x.id === m.id) + 1, n: meters.length }) : t("Contor")}</p>
+          <p className="text-base font-bold">{m.contor}</p>
+          {m.address && <p className="text-xs text-ink-soft">🏠 {m.address}</p>}
+          {m.consumer && <p className="text-[11px] text-ink-soft">{m.consumer}</p>}
+          {m.metroDue && (
+            <p className="mt-1 text-xs text-ink-soft" data-portal-metrology="">
+              🔧 {t("Verificare metrologică valabilă până la")}: <b><ContractExpiry date={m.metroDue} /></b>
+            </p>
+          )}
+          {m.metroDue && daysUntil(m.metroDue) <= 60 && (
+            <p className="mt-1 rounded-lg bg-st-progress/10 px-2 py-1 text-[11px] font-medium text-st-progress">
+              {daysUntil(m.metroDue) < 0 ? t("Verificarea metrologică a expirat. Contactați-ne pentru a programa verificarea.") : t("Verificarea metrologică se apropie de scadență. Contactați-ne pentru a programa verificarea.")}
+            </p>
+          )}
+        </div>
+
+        <div className="grid gap-2 rounded-xl border border-[var(--color-line)] bg-[var(--color-surface-2)]/50 p-3 text-sm sm:grid-cols-2">
+          <div>
+            <p className="text-[11px] text-ink-soft">{t("Ultimul index cunoscut")}</p>
+            <p className="font-semibold tabular-nums">{m.lastIndex != null ? `${nf(m.lastIndex)} m³` : "—"}{m.lastDate && <span className="ml-1 text-xs font-normal text-ink-soft">({fmtDay(m.lastDate)})</span>}</p>
+          </div>
+          <div>
+            <p className="text-[11px] text-ink-soft">{t("Citirea pentru {period}", { period: periodLabel })}</p>
+            {m.thisMonth ? (
+              <p className="font-semibold tabular-nums">
+                {nf(m.thisMonth.value)} m³
+                <span className="ml-1 text-xs font-normal text-ink-soft">({fmtDay(m.thisMonth.readAt)} · {m.thisMonth.source === "PORTAL" ? t("trimisă de tine") : m.thisMonth.source === "LORAWAN" ? t("primită automat (LoRaWAN)") : t("citită de cititor")})</span>
+              </p>
+            ) : (
+              <p className="font-semibold text-st-progress">{m.auto ? t("încă nu a sosit") : m.pending ? t("în așteptarea confirmării din email") : t("încă netrimisă")}</p>
+            )}
+          </div>
+          {m.openIssues.length > 0 && (
+            <div className="sm:col-span-2">
+              <p className="text-[11px] text-ink-soft">{t("Stare raportată (în verificare)")}</p>
+              <p className="text-xs">{m.openIssues.map((i) => t(ISSUE_LABELS[i.kind])).join(" · ")}</p>
+            </div>
+          )}
+          {m.thisMonth?.photoUrl && (
+            <a href={m.thisMonth.photoUrl} target="_blank" rel="noreferrer" className="text-xs font-semibold text-brand underline sm:col-span-2">{t("Vezi poza trimisă")}</a>
+          )}
+        </div>
+
+        {m.auto ? (
+          <p className="rounded-xl bg-brand-soft/60 p-3 text-sm" data-portal-lorawan="">{t("Acest contor transmite automat indexul (LoRaWAN). Nu trebuie să trimiți citirea.")}</p>
+        ) : doneByField ? (
+          <p className="rounded-xl bg-brand-soft/60 p-3 text-sm">{t("Pentru luna aceasta citirea a fost deja înregistrată de cititor. Mulțumim!")}</p>
+        ) : (
+          <form
+            onSubmit={(e) => { e.preventDefault(); void submit(false); }}
+            className="flex flex-col gap-3"
+          >
+            {m.pending && (
+              <div className="rounded-xl border border-st-progress/40 bg-st-progress/8 p-3 text-sm" data-portal-pending="">
+                <p className="font-semibold">⏳ {t("Citirea {value} m³ așteaptă confirmarea din email", { value: nf(m.pending.value) })}</p>
+                <p className="mt-0.5 text-xs text-ink-soft">{t("Nu este trimisă până nu apeși „Confirm citirea” în emailul primit. Dacă nu l-ai primit, verifică și dosarul Spam sau retrimite-l.")}</p>
+                <button type="button" onClick={() => void resend()} disabled={resending || m.pending.emailsSent >= 5} data-portal-resend="" className="tap mt-2 h-9 cursor-pointer rounded-lg border border-[var(--color-line)] px-3 text-xs font-semibold hover:bg-[var(--color-surface-2)] disabled:opacity-50">
+                  {resending ? t("Se trimite…") : t("Retrimite emailul")}
+                </button>
+              </div>
+            )}
+            <label className="text-xs font-semibold text-ink-soft">
+              {multi ? t("Indexul contorului {contor} (m³)", { contor: m.contor }) : t("Indexul contorului (m³)")}
+              <input
+                value={value}
+                onChange={(e) => { setValue(sanitizeIndexInput(e.target.value)); setConfirm(null); }}
+                onKeyDown={(e) => { if (e.key === "," || e.key === ".") e.preventDefault(); }}
+                inputMode="numeric"
+                pattern="[0-9]*"
+                data-index-input
+                placeholder={m.lastIndex != null ? `≥ ${nf(Math.ceil(m.lastIndex))}` : t("ex. 1234")}
+                className={`${inp} mt-1 text-lg font-semibold tabular-nums`}
+                required
+              />
+            </label>
+
+            <div>
+              <p className="mb-1 text-xs font-semibold text-ink-soft">{t("Poza contorului")} <span className="text-st-cancelled">*</span> <span className="font-normal">({t("obligatorie")})</span></p>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/*"
+                capture="environment"
+                required
+                data-portal-photo=""
+                onChange={(e) => {
+                  const f = e.target.files?.[0] ?? null;
+                  setPhoto(f);
+                  setPreview(f ? URL.createObjectURL(f) : null);
+                  if (f && geoState !== "ok") void askLocation(); // locația se pornește odată cu poza (apare cererea de permisiune)
+                }}
+                className="block w-full text-xs file:mr-3 file:h-10 file:cursor-pointer file:rounded-xl file:border-0 file:bg-brand file:px-4 file:text-sm file:font-semibold file:text-white"
+              />
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              {preview && <img src={preview} alt="" className="mt-2 max-h-48 rounded-xl border border-[var(--color-line)] object-contain" />}
+              <p className="mt-1 text-[11px] text-ink-soft">{t("Fotografiază cadranul cu indexul, ca să se vadă clar cifrele.")}</p>
+              <p className={`mt-1 text-[11px] ${geoState === "off" ? "text-st-progress" : "text-ink-soft"}`} data-portal-geo={geoState}>
+                {geoState === "ok" ? `📍 ${t("Locația a fost preluată.")}` : geoState === "asking" ? `📍 ${t("Se preia locația…")}` : geoState === "off" ? `📍 ${t("Locația nu este activă. Permite accesul la locație în browser, ca să o atașăm la citire.")}` : `📍 ${t("Locația se cere la alegerea pozei. Te rugăm să o permiți.")}`}
+              </p>
+            </div>
+
+            <label className="text-xs font-semibold text-ink-soft">
+              {t("Starea contorului")}
+              <select value={kind} onChange={(e) => setKind(e.target.value)} className={`${inp} mt-1`}>
+                <option value="">{t("Normal — fără probleme")}</option>
+                {PORTAL_ISSUE_KINDS.map((k) => (
+                  <option key={k} value={k}>{t(ISSUE_LABELS[k])}</option>
+                ))}
+              </select>
+            </label>
+            {kind && (
+              <label className="text-xs font-semibold text-ink-soft">
+                {kind === "OTHER" ? t("Descrie problema") : t("Observații (opțional)")}
+                <textarea value={note} onChange={(e) => setNote(e.target.value)} maxLength={500} rows={2} className="mt-1 w-full rounded-xl border border-[var(--color-line)] bg-[var(--color-surface-2)] px-3 py-2 text-sm outline-none focus:border-brand" required={kind === "OTHER"} />
+              </label>
+            )}
+
+            {confirm && (
+              <div className="rounded-xl border border-st-progress/40 bg-st-progress/8 p-3 text-sm">
+                <p className="font-semibold">
+                  {confirm === "lower"
+                    ? t("Indexul e mai mic decât cel anterior ({last} m³).", { last: nf(m.lastIndex ?? 0) })
+                    : confirmAvg
+                      ? t("Consumul pare neobișnuit de mare: cu {p}% peste media lunară a contorului ({a} m³).", { p: nf(confirmAvg.pct), a: nf(confirmAvg.avg) })
+                      : t("Consumul pare neobișnuit de mare (peste {n} m³).", { n: JUMP_CONFIRM_M3 })}
+                </p>
+                <p className="mt-0.5 text-xs text-ink-soft">{t("Verifică cifrele. Dacă indexul e corect (ex. contor înlocuit), confirmă.")}</p>
+                <button type="button" disabled={pending} onClick={() => void submit(true)} className="tap mt-2 h-10 cursor-pointer rounded-xl bg-st-progress px-4 text-sm font-semibold text-white disabled:opacity-50">
+                  {t("Da, indexul e corect")}
+                </button>
+              </div>
+            )}
+
+            {msg && <p className={`rounded-xl px-3 py-2 text-sm ${msg.ok ? "bg-brand-soft/60 text-ink" : "bg-st-cancelled/10 text-st-cancelled"}`}>{msg.text}</p>}
+            {multi && msg?.ok && nextUnread && (
+              <button type="button" onClick={() => setSel(nextUnread.id)} className="tap h-10 cursor-pointer rounded-xl border border-brand px-4 text-sm font-semibold text-brand hover:bg-brand-soft">
+                {t("Următorul contor de citit: {contor} →", { contor: nextUnread.contor })}
+              </button>
+            )}
+
+            <button type="submit" disabled={pending || !value.trim() || !photo} className="tap h-12 cursor-pointer rounded-xl bg-brand text-base font-semibold text-white hover:bg-brand-strong disabled:opacity-50">
+              {pending ? t("Se trimite…") : m.thisMonth ? (multi ? t("Actualizează citirea contorului {contor}", { contor: m.contor }) : t("Actualizează citirea")) : multi ? t("Trimite citirea contorului {contor}", { contor: m.contor }) : t("Trimite citirea")}
+            </button>
+          </form>
+        )}
+
+        {m.history.length > 0 && (
+          <div>
+            <p className="mb-1 text-xs font-semibold text-ink-soft">{t("Citiri anterioare")}</p>
+            <div className="divide-y divide-[var(--color-line)] overflow-hidden rounded-xl border border-[var(--color-line)] text-sm">
+              {m.history.map((h) => (
+                <div key={h.id} className="flex items-center justify-between gap-3 px-3 py-1.5">
+                  <span className="text-xs text-ink-soft">{new Date(`${h.period}-15T12:00:00`).toLocaleDateString(tag, { month: "long", year: "numeric" })}</span>
+                  <span className="text-right tabular-nums">
+                    <b>{nf(h.value)} m³</b>
+                    {h.consum != null && <span className="ml-2 text-xs text-ink-soft">+{nf(h.consum)}</span>}
+                    {h.photoUrl && <a href={h.photoUrl} target="_blank" rel="noreferrer" className="ml-2 text-xs text-brand underline">{t("poză")}</a>}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}

@@ -1,0 +1,63 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+!.env.example
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# logs
+*.log
+
+.vercel
+
+.vercel
+.env*
+
+# copiat din node_modules de scripts/copy-maplibre-worker.mjs
+public/maplibre-gl-worker.mjs
+
+# fișierele încărcate (poze, atașamente) — pe disc, nu în git
+/storage/
+
+# date personale reale (abonați, telefoane, proprietari de contoare) și arhive — NU se publică; folosite doar de scripturi one-off din scripts/
+/public/Tabel1.xlsx
+/public/Tabel1-completat.xlsx
+/public/device_admin_table_axioma_w1_water_meters_list.xlsx
+/public/projects-*.xlsx
+/StefanPWA-main*.zip

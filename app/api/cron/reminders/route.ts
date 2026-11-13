@@ -1,0 +1,68 @@
+import { env } from "@/lib/env";
+import { processDueReminders } from "@/lib/services/reminders";
+import { checkTaskReminders } from "@/lib/services/tasks";
+import { checkAppointmentReminders } from "@/lib/services/appointment-reminders";
+import { checkContractExpiry } from "@/lib/services/contract-expiry";
+import { checkMetrologyExpiry } from "@/lib/services/metrology-expiry";
+import { checkMeterIssueDeadlines } from "@/lib/services/meter-issue-deadlines";
+import { withDeliveryMeta } from "@/lib/delivery-log";
+import { runDueNotifySchedules } from "@/lib/services/notify-schedules";
+
+export const dynamic = "force-dynamic";
+export const maxDuration = 60;
+
+/**
+ * Procesează remindere scadente pentru programări (Appointment) ȘI reamintirile sarcinilor / tichetelor (interval fix sau programate la o oră anume):
+ * apelat des (la 5–15 minute), ca reamintirile programate să plece la ora aleasă. checkOverdueTasks rulează din /api/cron (o dată pe zi).
+ */
+async function run(req: Request) {
+  const auth = req.headers.get("authorization");
+  const url = new URL(req.url);
+  const tokenOk =
+    auth === `Bearer ${env.cronSecret}` ||
+    url.searchParams.get("secret") === env.cronSecret;
+
+  if (!env.cronSecret || !tokenOk) {
+    return new Response("forbidden", { status: 401 });
+  }
+
+  const [reminders, taskReminders, appointmentReminders, contractExpiry, metrologyExpiry, issueDeadlines, notifySchedules] = await withDeliveryMeta({ source: "cron:reminders" }, () =>
+    Promise.all([
+      processDueReminders(),
+      checkTaskReminders().catch((e) => {
+        console.error("[cron/reminders] reamintirile sarcinilor:", e);
+        return { checked: 0, notified: 0 };
+      }),
+      checkAppointmentReminders().catch((e) => {
+        console.error("[cron/reminders] reamintirile programărilor:", e);
+        return { checked: 0, notified: 0 };
+      }),
+      checkContractExpiry().catch((e) => {
+        console.error("[cron/reminders] expirarea contractelor:", e);
+        return { due: 0, notified: 0 };
+      }),
+      checkMetrologyExpiry().catch((e) => {
+        console.error("[cron/reminders] verificările metrologice:", e);
+        return { due: 0, notified: 0 };
+      }),
+      checkMeterIssueDeadlines().catch((e) => {
+        console.error("[cron/reminders] termenele neregulilor de contor:", e);
+        return { due: 0, notified: 0 };
+      }),
+      // notificările programate către plătitori / clienți
+      runDueNotifySchedules().catch((e) => {
+        console.error("[cron/reminders] notificările programate:", e);
+        return { due: 0, ran: 0 };
+      }),
+    ]),
+  );
+  return Response.json({ ok: true, reminders, taskReminders, appointmentReminders, contractExpiry, metrologyExpiry, issueDeadlines, notifySchedules });
+}
+
+export async function GET(req: Request) {
+  return run(req);
+}
+
+export async function POST(req: Request) {
+  return run(req);
+}

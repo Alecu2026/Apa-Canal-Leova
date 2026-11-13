@@ -1,0 +1,459 @@
+@import "tailwindcss";
+
+/* Dark mode prin clasă pe <html> (toggle manual din setări). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-app: #f5f6f8;
+  --color-surface: #ffffff;
+  --color-surface-2: #eef0f4;
+  --color-ink: #0f172a;
+  --color-ink-soft: #475569;
+  --color-line: #e2e8f0;
+
+  --color-brand: #0d9488;
+  --color-brand-strong: #0f766e;
+  --color-brand-soft: #ccfbf1;
+
+  --color-st-new: #64748b;
+  --color-st-confirmed: #2563eb;
+  --color-st-progress: #d97706;
+  --color-st-done: #059669;
+  --color-st-cancelled: #e11d48;
+  --color-st-noshow: #9333ea;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  --radius-xl: 1rem;
+}
+
+/* Tokeni care se schimbă în dark */
+.dark {
+  --color-app: #0a0c10;
+  --color-surface: #12161d;
+  --color-surface-2: #1b212b;
+  --color-ink: #e6e9ef;
+  --color-ink-soft: #94a3b8;
+  --color-line: #232b36;
+  --color-brand-soft: #134e4a;
+}
+
+/* Controalele native (liste <select>, date, scrollbar) își iau culorile din temă — altfel în dark lista de opțiuni
+   rămânea albă, cu text deschis (invizibil). `option` are nevoie de culori explicite pe Windows/Chrome. */
+:root {
+  color-scheme: light;
+}
+.dark {
+  color-scheme: dark;
+}
+select option,
+select optgroup {
+  background-color: var(--color-surface);
+  color: var(--color-ink);
+}
+
+/* Cursor „pointer" pe tot ce se poate apăsa (butoane, dropdown-uri, bife, <summary>) — inclusiv statusurile.
+   În @layer base, deci clasele utilitare (ex. cursor-default pe butoane dezactivate) o pot suprascrie. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]),
+  select:not(:disabled),
+  summary,
+  input[type="checkbox"]:not(:disabled),
+  input[type="radio"]:not(:disabled),
+  input[type="date"]:not(:disabled),
+  input[type="time"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  /* Pe telefon (iOS/Android) câmpurile de dată/oră au o lățime proprie și ies din coloana grilei; le ținem în container. */
+  input[type="date"],
+  input[type="time"],
+  input[type="datetime-local"],
+  input[type="month"] {
+    min-width: 0;
+    max-width: 100%;
+    -webkit-appearance: none;
+    appearance: none;
+  }
+  input[type="date"]::-webkit-date-and-time-value,
+  input[type="time"]::-webkit-date-and-time-value,
+  input[type="datetime-local"]::-webkit-date-and-time-value {
+    text-align: left;
+    min-width: 0;
+  }
+}
+
+/* Elementele unei grile pot fi mai înguste decât conținutul lor (altfel un câmp lat le împinge în afara ecranului). */
+form .grid > *,
+dialog .grid > * {
+  min-width: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  background: var(--color-app);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+  /* previne scroll orizontal accidental fără a rupe position: sticky */
+  overflow-x: clip;
+}
+
+/* Scrollbar discret */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+@layer utilities {
+  .card {
+    background: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-xl);
+  }
+  .tap {
+    transition: transform 0.08s ease, background-color 0.15s ease, border-color 0.15s ease;
+  }
+  .tap:active {
+    transform: scale(0.97);
+  }
+  /* Listele <select> NU se scalează la apăsare: fereastra nativă de opțiuni ține starea „apăsat” instabilă (mouse / deget capturat de fereastră),
+     iar lista se micșora și se mărea în loop. */
+  select.tap,
+  select.tap:active {
+    transform: none;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+  }
+  /* Arrow for styled <select> — use with appearance-none + pl-2 pr-7 */
+  .sel-arrow {
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3E%3Cpath stroke='%2394a3b8' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 0.35rem center;
+    background-size: 1.15em 1.15em;
+  }
+}
+
+
+/* Bara de progres de sus, vizibilă imediat la click pe un element de meniu (vezi NavPending în AppShell). */
+.nav-progress {
+  position: fixed;
+  inset: 0 0 auto 0;
+  z-index: 70;
+  height: 3px;
+  background: linear-gradient(90deg, transparent, var(--color-brand), transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: nav-progress 0.9s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes nav-progress {
+  from { background-position: -40% 0; }
+  to { background-position: 140% 0; }
+}
+
+/* Meniul lateral: derulare discretă când nu încap toate elementele */
+.sidebar-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line) transparent;
+}
+
+/* Tabele: hover pe rând. Celulele au fundal propriu, deci hover-ul se aplică pe celule; culoarea se poate alege din „Culori tabel” (--dt-hover). */
+.dt-root tbody tr:hover > td,
+.dt-root .dt-hover-sample > td {
+  background-color: var(--dt-hover, color-mix(in srgb, var(--color-brand-soft) 45%, var(--color-surface)));
+}
+/* Controale în celule (text editabil, liste, chip-uri de status): hover vizibil peste ORICE fundal de rând (zebră, hover de rând, culoare de rând) — un inel + o tentă transparentă de brand */
+.dt-ctl,
+.dt-chip {
+  transition: box-shadow 0.12s ease, background-color 0.12s ease, filter 0.12s ease;
+}
+.dt-ctl:hover:not(:disabled) {
+  background-color: color-mix(in srgb, var(--color-brand) 16%, transparent);
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--color-brand) 55%, transparent);
+}
+.dt-chip:hover:not(:disabled) {
+  filter: brightness(0.94) saturate(1.15);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-brand) 55%, transparent);
+}
+/* mânerul de redimensionare a coloanelor */
+.dt-resize {
+  touch-action: none;
+}
+
+/* Culoarea unui rând (aleasă de utilizator): fundal ușor pe tot rândul + bară colorată în stânga; la hover culoarea se intensifică */
+.dt-root tbody tr[data-rc] > td {
+  background-color: color-mix(in srgb, var(--dt-rc) 18%, var(--dt-row, var(--color-surface)));
+}
+.dt-root tbody tr[data-rc]:hover > td {
+  background-color: color-mix(in srgb, var(--dt-rc) 32%, var(--dt-row, var(--color-surface)));
+}
+.dt-root tbody tr[data-rc] > td:first-child {
+  box-shadow: inset 4px 0 0 var(--dt-rc);
+}
+
+/* ── Harta (MapLibre): ferestre (pop-up) prietenoase, în temă ── */
+.mp-pop.maplibregl-popup {
+  z-index: 5;
+}
+.mp-pop .maplibregl-popup-content {
+  padding: 0;
+  border-radius: 16px;
+  background: var(--color-surface);
+  color: var(--color-ink);
+  border: 1px solid var(--color-line);
+  box-shadow: 0 12px 32px rgb(15 23 42 / 0.22), 0 2px 6px rgb(15 23 42 / 0.1);
+  font-family: inherit;
+}
+.mp-pop .maplibregl-popup-close-button {
+  top: 8px;
+  right: 8px;
+  width: 26px;
+  height: 26px;
+  border-radius: 9999px;
+  font-size: 18px;
+  line-height: 24px;
+  color: var(--color-ink-soft);
+  background: var(--color-surface-2);
+}
+.mp-pop .maplibregl-popup-close-button:hover {
+  background: var(--color-line);
+  color: var(--color-ink);
+}
+.mp-pop.maplibregl-popup-anchor-top .maplibregl-popup-tip,
+.mp-pop.maplibregl-popup-anchor-top-left .maplibregl-popup-tip,
+.mp-pop.maplibregl-popup-anchor-top-right .maplibregl-popup-tip {
+  border-bottom-color: var(--color-surface);
+}
+.mp-pop.maplibregl-popup-anchor-bottom .maplibregl-popup-tip,
+.mp-pop.maplibregl-popup-anchor-bottom-left .maplibregl-popup-tip,
+.mp-pop.maplibregl-popup-anchor-bottom-right .maplibregl-popup-tip {
+  border-top-color: var(--color-surface);
+}
+.mp-pop.maplibregl-popup-anchor-left .maplibregl-popup-tip {
+  border-right-color: var(--color-surface);
+}
+.mp-pop.maplibregl-popup-anchor-right .maplibregl-popup-tip {
+  border-left-color: var(--color-surface);
+}
+.mp {
+  min-width: 230px;
+  max-width: 300px;
+  padding: 14px 14px 12px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+.mp-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding-right: 26px;
+}
+.mp-dot {
+  flex-shrink: 0;
+  width: 10px;
+  height: 10px;
+  margin-top: 4px;
+  border-radius: 9999px;
+}
+.mp-titles {
+  min-width: 0;
+}
+.mp-title {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--color-brand-strong);
+  overflow-wrap: anywhere;
+}
+.dark .mp-title {
+  color: var(--color-brand);
+}
+.mp-tag {
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--color-brand-soft);
+  color: var(--color-brand-strong);
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  vertical-align: 1px;
+}
+.dark .mp-tag {
+  color: var(--color-ink);
+}
+.mp-sub {
+  margin-top: 1px;
+  color: var(--color-ink);
+  font-size: 12.5px;
+}
+.mp-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 8px;
+}
+.mp-status {
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--c) 15%, transparent);
+  color: var(--c);
+  font-size: 11.5px;
+  font-weight: 600;
+}
+.mp-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  color: var(--color-ink-soft);
+  font-size: 12px;
+}
+.mp-line {
+  display: flex;
+  gap: 6px;
+}
+.mp-line > span:first-child {
+  flex-shrink: 0;
+  width: 16px;
+  text-align: center;
+}
+.mp-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+}
+.mp-btn {
+  flex: 1;
+  padding: 7px 8px;
+  border-radius: 10px;
+  border: 1px solid var(--color-line);
+  background: var(--color-surface-2);
+  color: var(--color-ink);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: center;
+  text-decoration: none;
+}
+.mp-btn:hover {
+  border-color: var(--color-brand);
+}
+.mp-btn-primary {
+  border-color: var(--color-brand);
+  background: var(--color-brand);
+  color: #fff;
+}
+.mp-btn-primary:hover {
+  background: var(--color-brand-strong);
+}
+.mp-nav {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--color-line);
+}
+.mp-nav-label {
+  margin-right: 2px;
+  color: var(--color-ink-soft);
+  font-size: 11.5px;
+}
+.mp-pill {
+  padding: 3px 9px;
+  border-radius: 9999px;
+  border: 1px solid var(--color-line);
+  color: var(--color-ink);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-decoration: none;
+}
+.mp-pill:hover {
+  border-color: var(--color-brand);
+  color: var(--color-brand-strong);
+}
+.mp-list {
+  padding: 0;
+  min-width: 250px;
+}
+.mp-list-head {
+  padding: 12px 40px 8px 14px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--color-ink-soft);
+}
+.mp-list-body {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 0 6px 6px;
+}
+.mp-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 10px;
+  color: var(--color-ink);
+  text-decoration: none;
+}
+.mp-row:hover {
+  background: var(--color-surface-2);
+}
+.mp-row .mp-dot {
+  margin-top: 0;
+}
+.mp-row-text {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+}
+.mp-row-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mp-row-sub {
+  color: var(--color-ink-soft);
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mp-row-go {
+  color: var(--color-brand);
+  font-weight: 700;
+}
+/* eticheta la trecerea mouse-ului peste un punct */
+.mp-tip.maplibregl-popup {
+  z-index: 4;
+  pointer-events: none;
+}
+.mp-tip .maplibregl-popup-content {
+  padding: 5px 9px;
+  border-radius: 9px;
+  background: var(--color-ink);
+  color: var(--color-surface);
+  box-shadow: 0 4px 12px rgb(15 23 42 / 0.25);
+}
+.mp-tip .maplibregl-popup-tip {
+  display: none;
+}
+.mp-hover {
+  display: flex;
+  flex-direction: column;
+  font-size: 12px;
+  line-height: 1.3;
+}
+.mp-hover span {
+  opacity: 0.75;
+  font-size: 11px;
+}

@@ -1,0 +1,277 @@
+import "server-only";
+import { prisma } from "../prisma";
+import { decryptSecret, encryptSecret } from "../secret-box";
+
+/**
+ * Sincronizarea plătitorilor Apă-Canal din noul serviciu 1C (Leova): `http://<server>/leova/hs/infoCec/info/apl/<dată>`, autentificare Basic.
+ * Aici: configurarea (link + credențiale, parola criptată în baza de date) și descărcarea răspunsului.
+ *
+ * Serviciul întoarce avizele de plată ale LUNII din dată (nu ale zilei): `…/apl/2026-10-15T12:00:00` = octombrie 2026. Luna curentă întoarce o listă goală până se închide.
+ * De aceea în configurație se salvează doar linkul de BAZĂ (`…/apl`, o dată lipită la sfârșit se ignoră), iar luna se adaugă din cod: implicit luna precedentă + cea curentă
+ * (se corectează plățile / recalculările de după emitere), sau o lună anume. Mai multe luni se unesc într-un singur JSON — fiecare aviz își poartă luna în câmpul `Data`.
+ * Procesarea propriu-zisă (parsare → plan → scriere) e în importApaCanalBuffer, apa-canal-import.ts.
+ */
+
+const KEY = "apa-canal-1c";
+const MAX_BYTES = 250 * 1024 * 1024;
+// Funcția de sincronizare are 300 s în total (vezi vercel.json — Hobby + Fluid Compute permite
+// 300 s, nu 60 s ca în modelul vechi). Dacă descărcarea ar primi tot bugetul, nu ar mai rămâne timp
+// pentru scris (mai ales la o extragere reală, cu mii de facturi noi) — funcția ar fi omorâtă brusc
+// de platformă, fără niciun mesaj de-al nostru. 120 s de descărcare lasă ~180 s pentru procesare.
+const TIMEOUT_MS = 120_000;
+// Toate lunile cerute se descarcă una după alta; împreună nu au voie să mănânce mai mult de atât din cele 300 s ale funcției.
+const TOTAL_FETCH_BUDGET_MS = 160_000;
+
+export type ApiConfigPublic = {
+  url: string;
+  username: string;
+  hasPassword: boolean;
+  hasToken: boolean;
+  lastSyncAt: string | null;
+  lastSyncOk: boolean | null;
+  lastSyncMessage: string | null;
+  /** Data ultimei sincronizări care a SCRIS date (nu doar test). */
+  lastSuccessAt: string | null;
+  /** Cron-ul zilnic extrage singur datele. */
+  autoSync: boolean;
+};
+
+const EMPTY: ApiConfigPublic = { url: "", username: "", hasPassword: false, hasToken: false, lastSyncAt: null, lastSyncOk: null, lastSyncMessage: null, lastSuccessAt: null, autoSync: false };
+
+/** Configurația fără secrete — asta e tot ce ajunge vreodată în browser. */
+export async function getApiConfigPublic(): Promise<ApiConfigPublic> {
+  const row = await prisma.apiIntegration.findFirst({ where: { key: KEY } });
+  if (!row) return EMPTY;
+  return {
+    url: row.url ?? "",
+    username: row.username ?? "",
+    hasPassword: !!decryptSecret(row.passwordEnc),
+    hasToken: !!decryptSecret(row.tokenEnc),
+    lastSyncAt: row.lastSyncAt ? row.lastSyncAt.toISOString() : null,
+    lastSyncOk: row.lastSyncOk,
+    lastSyncMessage: row.lastSyncMessage,
+    lastSuccessAt: row.lastSuccessAt ? row.lastSuccessAt.toISOString() : null,
+    autoSync: row.autoSyncEnabled === true,
+  };
+}
+
+export type ApiConfigInput = {
+  url: string;
+  username: string;
+  /** undefined = păstrează parola existentă; "" = șterge-o; altfel = parola nouă. */
+  password?: string;
+  token?: string;
+};
+
+export function validateApiUrl(raw: string): { ok: true; url: string } | { ok: false; error: string } {
+  const value = raw.trim();
+  if (!value) return { ok: false, error: "Introdu linkul API-ului." };
+  if (value.length > 600) return { ok: false, error: "Link prea lung." };
+  let u: URL;
+  try {
+    u = new URL(value);
+  } catch {
+    return { ok: false, error: "Linkul nu e valid (ex: http://server.exemplu.md:85/leova/hs/infoCec/info/apl)." };
+  }
+  if (u.protocol !== "https:" && u.protocol !== "http:") return { ok: false, error: "Linkul trebuie să înceapă cu http:// sau https://." };
+  if (u.username || u.password) return { ok: false, error: "Nu pune login/parola în link — completează-le în câmpurile de mai jos." };
+  return { ok: true, url: u.toString() };
+}
+
+export async function saveApiConfig(input: ApiConfigInput, userId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const v = validateApiUrl(input.url);
+  if (!v.ok) return v;
+  const username = input.username.trim().slice(0, 200);
+
+  const existing = await prisma.apiIntegration.findFirst({ where: { key: KEY } });
+  const passChanged = input.password !== undefined && (input.password !== "" || !!existing?.passwordEnc);
+  const tokenChanged = input.token !== undefined && (input.token !== "" || !!existing?.tokenEnc);
+  const changed = !!existing && (v.url !== (existing.url ?? "") || username !== (existing.username ?? "") || passChanged || tokenChanged);
+  const data = {
+    url: v.url,
+    username: username || null,
+    passwordEnc: input.password === undefined ? existing?.passwordEnc ?? null : input.password === "" ? null : encryptSecret(input.password),
+    tokenEnc: input.token === undefined ? existing?.tokenEnc ?? null : input.token === "" ? null : encryptSecret(input.token),
+    updatedById: userId,
+    // Setări schimbate = ce a mers înainte nu mai e garantat: oprește automatul și cere o nouă testare.
+    ...(changed
+      ? { autoSyncEnabled: false, lastSyncOk: null, lastContentHash: null, lastSyncMessage: "Setările s-au schimbat — testează conexiunea din nou." }
+      : {}),
+  };
+  if (existing) await prisma.apiIntegration.update({ where: { id: existing.id }, data });
+  else await prisma.apiIntegration.create({ data: { key: KEY, ...data } });
+  return { ok: true };
+}
+
+export async function recordSync(ok: boolean, message: string, opts: { wrote?: boolean; contentHash?: string | null } = {}) {
+  const existing = await prisma.apiIntegration.findFirst({ where: { key: KEY }, select: { id: true } });
+  if (!existing) return;
+  const now = new Date();
+  await prisma.apiIntegration.update({
+    where: { id: existing.id },
+    data: {
+      lastSyncAt: now,
+      lastSyncOk: ok,
+      lastSyncMessage: message.slice(0, 500),
+      ...(ok && opts.wrote ? { lastSuccessAt: now } : {}),
+      ...(opts.contentHash !== undefined ? { lastContentHash: opts.contentHash } : {}),
+    },
+  });
+}
+
+/**
+ * Pornește/oprește extragerea automată (cron). Pornirea cere ca ultima încercare cu setările curente
+ * să fi reușit — "dacă a mers o dată, o lăsăm să meargă singură". Oprirea e mereu permisă.
+ */
+export async function setAutoSync(enabled: boolean): Promise<{ ok: true } | { ok: false; error: string }> {
+  const row = await prisma.apiIntegration.findFirst({ where: { key: KEY } });
+  if (!row?.url) return { ok: false, error: "API-ul nu e configurat." };
+  if (enabled && row.lastSyncOk !== true) {
+    return { ok: false, error: "Sincronizarea automată se poate porni doar după o testare sau o sincronizare reușită cu setările curente." };
+  }
+  await prisma.apiIntegration.update({ where: { id: row.id }, data: { autoSyncEnabled: enabled } });
+  return { ok: true };
+}
+
+/** Datele pentru cron: configurația + contul în numele căruia rulează (ultimul care a salvat setările). */
+export async function getAutoSyncState() {
+  const row = await prisma.apiIntegration.findFirst({ where: { key: KEY } });
+  if (!row || !row.url || row.autoSyncEnabled !== true) return null;
+  let owner = row.updatedById ? await prisma.user.findFirst({ where: { id: row.updatedById, isActive: true }, select: { id: true, name: true, role: true, isSuperAdmin: true } }) : null;
+  if (!owner) owner = await prisma.user.findFirst({ where: { role: "ADMIN", isActive: true }, orderBy: { createdAt: "asc" }, select: { id: true, name: true, role: true, isSuperAdmin: true } });
+  return owner ? { owner, lastContentHash: row.lastContentHash } : null;
+}
+
+/**
+ * Blocare "o singură sincronizare odată" (valabilă 10 min, ca să nu rămână blocat pe veci după un
+ * crash — inclusiv un timeout dur de platformă, care omite blocul `finally` ce ar elibera-o normal).
+ * `ok:false` dacă rulează deja una; `until` e ora exactă la care se eliberează singură, ca mesajul
+ * din UI să spună concret "încearcă după ora X", nu doar "peste câteva minute".
+ */
+export async function acquireSyncLock(): Promise<{ ok: boolean; until?: Date }> {
+  const row = await prisma.apiIntegration.findFirst({ where: { key: KEY }, select: { id: true, syncLockUntil: true } });
+  if (!row) return { ok: false };
+  const now = new Date();
+  const until = new Date(now.getTime() + 10 * 60_000);
+  const res = await prisma.apiIntegration.updateMany({
+    // câmpul poate lipsi complet din document (nu doar să fie null) — de-aia și isSet:false
+    where: { id: row.id, OR: [{ syncLockUntil: null }, { syncLockUntil: { isSet: false } }, { syncLockUntil: { lt: now } }] },
+    data: { syncLockUntil: until },
+  });
+  return res.count === 1 ? { ok: true } : { ok: false, until: row.syncLockUntil ?? undefined };
+}
+
+export async function releaseSyncLock() {
+  await prisma.apiIntegration.updateMany({ where: { key: KEY }, data: { syncLockUntil: null } });
+}
+
+export class ApiFetchError extends Error {}
+
+const DATE_SEGMENT = /^\d{4}-\d{2}-\d{2}(?:T[0-9:.+\-Zz]*)?$/;
+export const MONTH_RE = /^\d{4}-(0[1-9]|1[0-2])$/;
+
+/** Linkul de bază: fără data lipită la sfârșit (cineva poate copia din 1C un link cu `…/apl/2025-07-17T12:29:30`). */
+export function apiBaseUrl(raw: string): URL {
+  const u = new URL(raw);
+  const segs = u.pathname.split("/");
+  let last = segs[segs.length - 1] ?? "";
+  try { last = decodeURIComponent(last); } catch { /* rămâne cum e */ }
+  if (DATE_SEGMENT.test(last)) segs.pop();
+  u.pathname = segs.join("/").replace(/\/+$/, "");
+  return u;
+}
+
+/** Linkul pentru o lună „AAAA-LL”: ziua 15, la prânz — serviciul ia luna din dată, deci o dată din mijlocul lunii nu poate trece în luna vecină. */
+export function monthUrl(raw: string, month: string): string {
+  const u = apiBaseUrl(raw);
+  u.pathname = `${u.pathname}/${month}-15T12:00:00`;
+  return u.toString();
+}
+
+const monthKey = (d: Date) => `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+
+/** Lunile cerute la o sincronizare: cea precedentă + cea curentă (vechi → nou), sau doar luna aleasă. */
+export function syncMonths(month?: string, now: Date = new Date()): string[] {
+  if (month) return [month];
+  const prev = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+  return [monthKey(prev), monthKey(now)];
+}
+
+/**
+ * Descarcă avizele din API-ul configurat (login/parolă Basic sau token Bearer) pentru lunile cerute și le unește într-un singur JSON (lista avizelor).
+ * Luna curentă, neînchisă, vine goală și e pur și simplu sărită; dacă toate lunile sunt goale, întoarce "[]" iar importul spune clar de ce nu are ce scrie.
+ */
+export async function fetchFromConfiguredApi(opts: { month?: string } = {}): Promise<Buffer> {
+  const row = await prisma.apiIntegration.findFirst({ where: { key: KEY } });
+  if (!row?.url) throw new ApiFetchError("API-ul nu e configurat. Completează linkul și credențialele.");
+  const username = row.username ?? "";
+  const password = decryptSecret(row.passwordEnc) ?? "";
+  const token = decryptSecret(row.tokenEnc) ?? "";
+  if (row.passwordEnc && !password) throw new ApiFetchError("Parola salvată nu mai poate fi citită (cheia aplicației s-a schimbat). Introdu-o din nou.");
+  if (opts.month && !MONTH_RE.test(opts.month)) throw new ApiFetchError("Luna trebuie să fie în formatul AAAA-LL (ex. 2026-10).");
+
+  const headers: Record<string, string> = { Accept: "application/json, text/plain, */*" };
+  if (username) headers.Authorization = `Basic ${Buffer.from(`${username}:${password}`, "utf8").toString("base64")}`;
+  else if (token) headers.Authorization = `Bearer ${token}`;
+
+  const deadline = Date.now() + TOTAL_FETCH_BUDGET_MS;
+  const all: unknown[] = [];
+  for (const month of syncMonths(opts.month)) {
+    const left = deadline - Date.now();
+    if (left < 5_000) throw new ApiFetchError(`Descărcarea avizelor a depășit timpul alocat (nu s-a mai apucat luna ${month}). Încearcă din nou.`);
+    const buf = await fetchOne(monthUrl(row.url, month), headers, Math.min(TIMEOUT_MS, left));
+    let list: unknown;
+    try {
+      list = JSON.parse(buf.toString("utf-8").replace(/^\uFEFF/, ""));
+    } catch {
+      throw new ApiFetchError(`Răspunsul 1C pentru ${month} nu e JSON valid.`);
+    }
+    if (!Array.isArray(list)) throw new ApiFetchError(`Răspunsul 1C pentru ${month} nu e o listă de avize (formatul serviciului s-a schimbat?).`);
+    all.push(...list);
+  }
+  return Buffer.from(JSON.stringify(all), "utf-8");
+}
+
+async function fetchOne(url: string, headers: Record<string, string>, timeoutMs: number): Promise<Buffer> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  let res: Response;
+  try {
+    res = await fetch(url, { headers, redirect: "manual", signal: ctrl.signal, cache: "no-store" });
+  } catch (e) {
+    clearTimeout(timer);
+    throw new ApiFetchError(describeNetworkError(e));
+  }
+
+  try {
+    if (res.status >= 300 && res.status < 400) {
+      throw new ApiFetchError(`API-ul redirecționează (${res.status}) către ${res.headers.get("location") ?? "altă adresă"}. Pune linkul final în configurare.`);
+    }
+    if (res.status === 401 || res.status === 403) throw new ApiFetchError(`API-ul a respins autentificarea (${res.status}) — verifică login-ul și parola.`);
+    if (res.status === 404) throw new ApiFetchError("Adresa nu există (404) — verifică linkul.");
+    if (!res.ok) throw new ApiFetchError(`API-ul a răspuns cu eroarea ${res.status}.`);
+
+    const declared = Number(res.headers.get("content-length"));
+    if (Number.isFinite(declared) && declared > MAX_BYTES) throw new ApiFetchError("Răspunsul API-ului e prea mare (peste 250 MB).");
+    const buf = Buffer.from(await res.arrayBuffer());
+    if (buf.length > MAX_BYTES) throw new ApiFetchError("Răspunsul API-ului e prea mare (peste 250 MB).");
+    if (buf.length === 0) throw new ApiFetchError("API-ul a răspuns gol.");
+    return buf;
+  } catch (e) {
+    if (e instanceof ApiFetchError) throw e;
+    throw new ApiFetchError(describeNetworkError(e));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function describeNetworkError(e: unknown): string {
+  const err = e as { name?: string; message?: string; cause?: { code?: string; message?: string } };
+  const code = err?.cause?.code ?? "";
+  if (err?.name === "AbortError") return "API-ul nu a răspuns la timp (timeout) — serviciul 1C durează ~20–30 s pe lună; încearcă din nou.";
+  if (code === "ECONNREFUSED") return "Conexiune refuzată — serverul nu e accesibil de aici. Dacă API-ul e doar în rețeaua locală, aplicația de pe internet nu îl poate atinge (trebuie expus public sau printr-un tunel/VPN).";
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") return "Adresa nu a fost găsită (DNS) — verifică numele serverului din link.";
+  if (code === "ETIMEDOUT" || code === "EHOSTUNREACH" || code === "ENETUNREACH" || code === "UND_ERR_CONNECT_TIMEOUT") return "Serverul nu răspunde — probabil e doar în rețeaua locală și nu poate fi atins de pe internet.";
+  if (/CERT|SSL|TLS|self.signed|unable to verify/i.test(code + " " + (err?.cause?.message ?? "") + " " + (err?.message ?? ""))) return "Certificatul SSL al serverului nu e valid (autosemnat sau expirat).";
+  return `Nu m-am putut conecta la API (${code || err?.message || "eroare necunoscută"}).`;
+}

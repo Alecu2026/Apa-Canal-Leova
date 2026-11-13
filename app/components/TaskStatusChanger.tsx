@@ -1,0 +1,125 @@
+"use client";
+
+import { useState, useTransition } from "react";
+import { useRouter } from "next/navigation";
+import { setTaskStatus } from "@/app/actions/tasks";
+import { useToast } from "./toast";
+import { useProofPrompt } from "./ProofDialog";
+import { useResolutionPrompt } from "./ResolutionDialog";
+import type { Resolution } from "@/lib/resolution";
+import { useMessages } from "@/lib/i18n/context";
+import { useT } from "@/lib/i18n/context";
+
+type Status = "NEW" | "ASSIGNED" | "READ" | "IN_PROGRESS" | "ON_HOLD" | "REVIEW" | "DONE" | "CANCELLED";
+
+const STATUS_COLORS: Record<Status, string> = {
+  NEW:         "bg-st-new/15 text-st-new border-st-new/40 hover:bg-st-new/30",
+  ASSIGNED:    "bg-st-new/15 text-st-new border-st-new/40 hover:bg-st-new/30",
+  READ:        "bg-st-confirmed/15 text-st-confirmed border-st-confirmed/40 hover:bg-st-confirmed/30",
+  IN_PROGRESS: "bg-st-progress/15 text-st-progress border-st-progress/40 hover:bg-st-progress/30",
+  ON_HOLD:     "bg-st-noshow/15 text-st-noshow border-st-noshow/40 hover:bg-st-noshow/30",
+  REVIEW:      "bg-st-confirmed/15 text-st-confirmed border-st-confirmed/40 hover:bg-st-confirmed/30",
+  DONE:        "bg-st-done/15 text-st-done border-st-done/40 hover:bg-st-done/30",
+  CANCELLED:   "bg-st-cancelled/15 text-st-cancelled border-st-cancelled/40 hover:bg-st-cancelled/30",
+};
+
+const ACTIVE_RING: Record<Status, string> = {
+  NEW:         "!bg-st-new !text-white !border-st-new",
+  ASSIGNED:    "!bg-st-new !text-white !border-st-new",
+  READ:        "!bg-st-confirmed !text-white !border-st-confirmed",
+  IN_PROGRESS: "!bg-st-progress !text-white !border-st-progress",
+  ON_HOLD:     "!bg-st-noshow !text-white !border-st-noshow",
+  REVIEW:      "!bg-st-confirmed !text-white !border-st-confirmed",
+  DONE:        "!bg-st-done !text-white !border-st-done",
+  CANCELLED:   "!bg-st-cancelled !text-white !border-st-cancelled",
+};
+
+export default function TaskStatusChanger({
+  taskId,
+  initialStatus,
+  disabled = false,
+  closeOnly = false,
+  canClose = true,
+  canCancel = true,
+  title,
+  createdAt,
+}: {
+  taskId: string;
+  /** Pentru fereastra „Finalizare cerere”: titlul și data depunerii. */
+  title?: string | null;
+  createdAt?: string | number | Date | null;
+  initialStatus: string;
+  /** Fără drept de lucru pe task: butoanele se văd, dar nu se pot apăsa. */
+  disabled?: boolean;
+  /** Doar „Finalizat / Anulat" se pot alege (cine nu lucrează la task, dar are „Închidere / finalizare" sau „Anulare"). */
+  closeOnly?: boolean;
+  /** „Închidere / finalizare": poate alege „Finalizat" când nu lucrează la task (closeOnly). */
+  canClose?: boolean;
+  /** „Anulare sarcini" / „Anulare cereri": poate alege „Anulat". */
+  canCancel?: boolean;
+}) {
+  const t = useT();
+  const router = useRouter();
+  const toast = useToast();
+  const proof = useProofPrompt();
+  const rp = useResolutionPrompt();
+  const m = useMessages();
+  const [, startTransition] = useTransition();
+  const [status, setStatus] = useState(initialStatus as Status);
+  const [busy, setBusy] = useState(false);
+
+  const STATUSES = (Object.keys(STATUS_COLORS) as Status[]).map((value) => ({
+    value,
+    label: m.status[value],
+    color: STATUS_COLORS[value],
+  }));
+
+  const blocked = (s: Status) => (s === "CANCELLED" && !canCancel) || (closeOnly && (s === "DONE" ? !canClose : s !== "CANCELLED"));
+
+  async function change(next: Status, resolution?: Resolution) {
+    if (next === status || busy || disabled || blocked(next)) return;
+    const prev = status;
+    setStatus(next);
+    setBusy(true);
+    try {
+      const res = await setTaskStatus(taskId, next, resolution);
+      if (res?.error) {
+        setStatus(prev);
+        if (res.needsResolution) rp.ask({ title, createdAt }, (r) => void change(next, r));
+        else if (res.needsProof) proof.ask(taskId, () => void change(next, resolution));
+        else toast.error(t(res.error));
+      } else {
+        toast.success(`Status: ${m.status[next]}`);
+        startTransition(() => router.refresh());
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {proof.node}
+      {rp.node}
+      {STATUSES.map((s) => {
+        const isActive = s.value === status;
+        return (
+          <button
+            key={s.value}
+            onClick={() => change(s.value)}
+            disabled={busy || disabled || blocked(s.value)}
+            className={[
+              disabled ? "cursor-not-allowed" : "",
+              "rounded-lg border px-3 py-1.5 text-xs font-semibold transition-all disabled:opacity-50",
+              s.color,
+              isActive ? ACTIVE_RING[s.value] : "",
+              isActive ? "scale-105 shadow-sm" : "opacity-70",
+            ].join(" ")}
+          >
+            {t(s.label)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}

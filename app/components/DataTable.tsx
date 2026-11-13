@@ -1,0 +1,949 @@
+"use client";
+
+import DateFilterInput from "./DateFilterInput";
+import TableColorsDialog from "./TableColorsDialog";
+import { useTableLook } from "./TableLookContext";
+import { colorVars, hasColors, headStyle, sanitizeColors, type TableColors } from "@/lib/table-look";
+import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  DEFAULT_PER_PAGE,
+  NOTIFY_PER_PAGE,
+  normalizePerPageClient,
+  perPageLabel,
+} from "@/lib/payer-notify";
+import { IconChevronLeft, IconChevronRight } from "./icons";
+import CompactCard, { CompactField } from "./CompactCard";
+import VirtualList from "./VirtualList";
+import FiltersToggle from "./FiltersToggle";
+import { useFiltersOpen } from "./useFiltersOpen";
+import { useT } from "@/lib/i18n/context";
+
+/**
+ * Tabel generic, în stilul paginii Plătitori: toate rândurile vin o dată de pe server, iar filtrele, sortarea
+ * și paginarea rulează în browser (instant). Filtrele active sunt colorate și, împreună cu sortarea și numărul de
+ * rânduri pe pagină, se salvează în localStorage. Click pe rând = `onRowClick` (de obicei un popup cu detalii).
+ */
+
+export type Col<T> = {
+  key: string;
+  label: string;
+  minW: number;
+  right?: boolean;
+  /** Valoarea după care se sortează la click pe antet (fără ea, coloana nu e sortabilă). */
+  sort?: (r: T) => string | number | null | undefined;
+  render: (r: T) => ReactNode;
+  /** Lățime maximă a celulei (textul lung se taie cu „…"). */
+  maxW?: number;
+  /** Coloană lipită la stânga la derulare orizontală (doar cât e în primele 2 coloane vizibile). */
+  sticky?: boolean;
+  /** Coloană disponibilă în „Coloane", dar ascunsă implicit (câmpuri în plus: descriere, tip…). */
+  defaultHidden?: boolean;
+};
+
+type Base = { key: string; label: string };
+export type SelectFilter<T> = Base & {
+  kind: "select";
+  options: { value: string; label: string }[];
+  test: (r: T, value: string) => boolean;
+};
+export type TextFilter<T> = Base & {
+  kind: "text";
+  placeholder?: string;
+  /** `value` e deja trim + lowercase. */
+  test: (r: T, value: string) => boolean;
+  /** Câmp mare (ocupă loc de căutare principală). */
+  grow?: boolean;
+  w?: number;
+};
+export type DateFilter<T> = Base & {
+  kind: "date";
+  test: (r: T, value: string) => boolean; // value = "YYYY-MM-DD"
+};
+export type Filter<T> = SelectFilter<T> | TextFilter<T> | DateFilter<T>;
+
+/** Aspectul tabelului (celule, text, culori) — personalizabil din „⚙ Coloane", salvat pe tabel. */
+export type Look = {
+  density: "compact" | "normal" | "roomy";
+  font: 10 | 11 | 13 | 15;
+  width: 85 | 100 | 125 | 150;
+  zebra: boolean;
+  header: "default" | "brand" | "sky" | "emerald" | "orange" | "violet" | "slate";
+  text: "default" | "brand" | "sky" | "emerald" | "violet" | "rose";
+};
+const DEFAULT_LOOK: Look = { density: "compact", font: 11, width: 100, zebra: false, header: "default", text: "default" };
+const DENSITY = {
+  compact: { cell: "py-px", head: "py-1", px: "px-1.5", lh: 14 },
+  normal: { cell: "py-1.5", head: "py-1.5", px: "px-2", lh: 16 },
+  roomy: { cell: "py-3", head: "py-2.5", px: "px-3", lh: 18 },
+} as const;
+const HEADER_CLS: Record<Look["header"], string> = {
+  default: "bg-[var(--color-surface-2)]",
+  brand: "bg-brand text-white",
+  sky: "bg-sky-600 text-white",
+  emerald: "bg-emerald-600 text-white",
+  orange: "bg-orange-500 text-white",
+  violet: "bg-violet-600 text-white",
+  slate: "bg-slate-700 text-white",
+};
+const TEXT_CLS: Record<Look["text"], string> = {
+  default: "",
+  brand: "text-brand-strong",
+  sky: "text-sky-700 dark:text-sky-300",
+  emerald: "text-emerald-700 dark:text-emerald-300",
+  violet: "text-violet-700 dark:text-violet-300",
+  rose: "text-rose-700 dark:text-rose-300",
+};
+const ZEBRA_BG = "bg-[var(--dt-zebra,color-mix(in_srgb,var(--color-surface-2)_70%,var(--color-surface)))]";
+
+type Persisted = {
+  /** Mod telefon (carduri): true/false = ales de utilizator; lipsă = automat (carduri pe ecran îngust). */
+  cm?: boolean;
+  v: Record<string, string>;
+  pp: number;
+  sk: string;
+  sd: "asc" | "desc";
+  /** Ordinea coloanelor (chei) aleasă de utilizator. */
+  co?: string[];
+  /** Coloane afișate/ascunse explicit de utilizator (cheie → vizibil). */
+  cv?: Record<string, boolean>;
+  /** Aspect (densitate, text, culori). */
+  lk?: Partial<Look>;
+  /** Lățimile coloanelor trase cu mouse-ul (px, pe cheia coloanei). */
+  cw?: Record<string, number>;
+  /** Culori alese din paleta completă (antet, text, fundal, hover, linii). */
+  cc?: TableColors;
+};
+
+const MIN_COL_W = 40;
+const MAX_COL_W = 900;
+
+const collator = new Intl.Collator("ro", { numeric: true });
+
+const fld = (val: string) =>
+  `h-7 min-w-0 max-w-full appearance-none sel-arrow rounded-lg border pl-1.5 pr-6 text-[11px] outline-none focus:border-brand ${
+    val ? "border-brand bg-brand/10 font-semibold text-brand" : "border-[var(--color-line)] bg-[var(--color-surface)] text-ink"
+  }`;
+const txtFld = (val: string) =>
+  `h-7 min-w-0 rounded-lg border px-2 text-[11px] outline-none focus:border-brand ${
+    val ? "border-brand bg-brand/10 font-semibold text-brand placeholder:font-normal" : "border-[var(--color-line)] bg-[var(--color-surface)] text-ink"
+  }`;
+
+const nf = (n: number) => n.toLocaleString("ro-RO");
+
+/** Peste atâtea rânduri pe pagină, în DOM stau doar rândurile din zona vizibilă (restul = un spațiu gol de înălțime potrivită). */
+const VIRT_MIN = 80;
+/** Rânduri randate în plus, deasupra și dedesubt, ca derularea rapidă să nu arate goluri. */
+const VIRT_OVER = 14;
+/** Înălțimea estimată a unui rând până se măsoară (compact / normal / spațios). */
+const ROW_EST = { compact: 20, normal: 32, roomy: 56 } as const;
+
+/**
+ * Selector de filtru memoizat: la o listă de mii de opțiuni (clienți, proiecte) React nu mai recompară toate `<option>` la fiecare
+ * randare a tabelului (derulare, scriere în alt câmp, editare inline) — doar când se schimbă efectiv opțiunile sau valoarea.
+ */
+const FilterSelect = memo(function FilterSelect({
+  fkey,
+  label,
+  options,
+  value,
+  onPick,
+}: {
+  fkey: string;
+  label: string;
+  options: { value: string; label: string }[];
+  value: string;
+  onPick: (key: string, value: string) => void;
+}) {
+  const t = useT();
+  return (
+    <select value={value} onChange={(e) => onPick(fkey, e.target.value)} className={fld(value)} aria-label={t(label)}>
+      <option value="">{t(label)}</option>
+      {options.map((o) => <option key={o.value} value={o.value}>{t(o.label)}</option>)}
+    </select>
+  );
+});
+
+export default function DataTable<T extends { id: string }>({
+  storageKey,
+  rows,
+  columns,
+  filters,
+  defaultSort,
+  onRowClick,
+  rowClickSkipsControls = false,
+  toolbar,
+  summaryExtra,
+  noun,
+  cardKeys,
+  cardAvatar,
+  emptyText,
+  rowClassName,
+  rowColor,
+  presetValues,
+  pending,
+}: {
+  storageKey: string;
+  rows: T[];
+  columns: Col<T>[];
+  filters: Filter<T>[];
+  defaultSort?: { key: string; dir: "asc" | "desc" };
+  onRowClick?: (r: T) => void;
+  /** Click pe un buton / link / câmp din interiorul rândului (status, progres, selectoare) nu declanșează și `onRowClick`. */
+  rowClickSkipsControls?: boolean;
+  /**
+   * Butoane în dreapta barei de filtre (ex. „+ Nou", Export). Ca funcție primește starea listei: `filtered` = sunt filtre active (în tabel au rămas mai puține rânduri decât lista întreagă),
+   * `getIds()` = id-urile rândurilor rămase, în ordinea tabelului, `count` = câte sunt — pentru un Export care chiar urmează filtrele.
+   */
+  toolbar?: ReactNode | ((view: { filtered: boolean; getIds: () => string[]; count: number; describeFilters: () => string[] }) => ReactNode);
+  /** Text în plus lângă numărătoare (primește lista filtrată). */
+  summaryExtra?: (filtered: T[]) => ReactNode;
+  /** Substantiv pentru numărătoare: „task-uri", „clienți"… */
+  noun?: string;
+  emptyText?: string;
+  rowClassName?: (r: T) => string;
+  /** Culoarea rândului (hex): fundal ușor + bară în stânga; la telefon, bară pe card. */
+  rowColor?: (r: T) => string | null | undefined;
+  /** Chei de coloane care alcătuiesc rezumatul cardului de pe telefon (titlu + două valori), în ordine; restul se vede la desfacere. */
+  cardKeys?: string[];
+  /** Litera din cercul cardului (implicit: prima literă a primei coloane). */
+  cardAvatar?: (r: T) => string;
+  /** Filtre din URL (ex. ?proj=…) — dacă există, înlocuiesc filtrele salvate la deschidere. */
+  presetValues?: Record<string, string | undefined>;
+  /**
+   * Lista completă încă se încarcă și `rows` conține doar primele rânduri: cât timp sunt filtre active nu arătăm rezultate parțiale
+   * (ar părea greșite), ci un mesaj; numărătoarea afișează totalul real.
+   */
+  pending?: { total: number };
+}) {
+  const t = useT();
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [perPage, setPerPage] = useState(DEFAULT_PER_PAGE);
+  const [page, setPage] = useState(1);
+  const [sortKey, setSortKey] = useState(defaultSort?.key ?? "");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(defaultSort?.dir ?? "asc");
+  const [ready, setReady] = useState(false);
+  // ── Coloane personalizabile: ordine (drag & drop sau ▲▼) și vizibilitate, salvate în localStorage ──
+  const [order, setOrder] = useState<string[]>([]);
+  const [vis, setVis] = useState<Record<string, boolean>>({});
+  // Aspectul predefinit de administrator = valoarea implicită; „Personalizare tabele” (permisiune) = poate schimba singur (localStorage, peste preset).
+  const { preset, canCustomize } = useTableLook();
+  const { colors: presetColors, ...presetLook } = preset;
+  // „Lățime coloane” (înguste / late) a fost scoasă: lățimea se schimbă trăgând de marginea antetului; o valoare veche salvată se ignoră
+  // „Lățime coloane”, „Culoare antet” și „Culoare text” au fost scoase din meniu: orice valoare veche (salvată pe dispozitiv / în șablonul adminului) se ignoră
+  const BASE_LOOK: Look = { ...DEFAULT_LOOK, ...presetLook, width: 100, header: "default", text: "default" };
+  const [look, setLook] = useState<Look>(BASE_LOOK);
+  /** Lățimi proprii ale coloanelor (px) și culori proprii — salvate în localStorage împreună cu restul aspectului. */
+  const [colW, setColW] = useState<Record<string, number>>({});
+  const [colors, setColors] = useState<TableColors>(presetColors ?? {});
+  const [colorsOpen, setColorsOpen] = useState(false);
+  const resizing = useRef(false);
+  const headRef = useRef<HTMLTableSectionElement>(null);
+  const [colsOpen, setColsOpen] = useState(false);
+  // Mod telefon: fiecare rând devine un card cu câmpurile unul sub altul. `cardsPref` = alegerea utilizatorului (null = automat:
+  // carduri pe ecrane înguste, tabel pe restul).
+  const [cardsPref, setCardsPref] = useState<boolean | null>(null);
+  const [narrow, setNarrow] = useState(false);
+  const cards = cardsPref ?? narrow;
+  const [dragKey, setDragKey] = useState<string | null>(null);
+  const [overKey, setOverKey] = useState<string | null>(null);
+  const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const colsBox = useRef<HTMLDivElement>(null);
+  const scrollBox = useRef<HTMLDivElement>(null);
+  const scrollRaf = useRef(0);
+  // Fereastra de randare a tabelului: poziția de derulare (rotunjită la câteva rânduri, ca să nu randăm la fiecare pixel), înălțimea vizibilă și înălțimea măsurată a unui rând.
+  const [vwin, setVwin] = useState({ top: 0, h: 720 });
+  const [rowH, setRowH] = useState<number>(ROW_EST.compact);
+  const STORAGE = `dt:${storageKey}`;
+  const [fOpen, toggleF] = useFiltersOpen(storageKey);
+
+  // Restaurează filtrele/sortarea/numărul de rânduri salvate (după hidratare — serverul nu are localStorage).
+  useEffect(() => {
+    let savedCols: Persisted | null = null;
+    try { savedCols = JSON.parse(localStorage.getItem(STORAGE) ?? "null") as Persisted | null; } catch {}
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setNarrow(window.matchMedia("(max-width: 639px)").matches);
+    if (savedCols && typeof savedCols.cm === "boolean") setCardsPref(savedCols.cm);
+    if (savedCols && canCustomize) {
+      const ck = new Set(columns.map((c) => c.key));
+      if (Array.isArray(savedCols.co)) setOrder(savedCols.co.filter((k) => ck.has(k)));
+      if (savedCols.lk) setLook({ ...BASE_LOOK, ...savedCols.lk, width: 100, header: "default", text: "default" });
+      if (savedCols.cw) setColW(Object.fromEntries(Object.entries(savedCols.cw).filter(([k, w]) => ck.has(k) && typeof w === "number" && w >= MIN_COL_W && w <= MAX_COL_W)));
+      if (savedCols.cc) setColors(sanitizeColors(savedCols.cc));
+      if (savedCols.cv) setVis(Object.fromEntries(Object.entries(savedCols.cv).filter(([k, b]) => ck.has(k) && typeof b === "boolean")));
+    }
+    const known = new Set(filters.map((f) => f.key));
+    const preset = Object.fromEntries(Object.entries(presetValues ?? {}).filter(([k, x]) => known.has(k) && typeof x === "string" && x)) as Record<string, string>;
+    if (Object.keys(preset).length > 0) {
+      setValues(preset);
+      setDraft(preset);
+      setReady(true);
+      return;
+    }
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE) ?? "null") as Persisted | null;
+      if (saved) {
+        const known = new Set(filters.map((f) => f.key));
+        const v = Object.fromEntries(Object.entries(saved.v ?? {}).filter(([k, x]) => known.has(k) && typeof x === "string" && x));
+        setValues(v);
+        setDraft(v);
+        setPerPage(normalizePerPageClient(saved.pp));
+        if (saved.sk && columns.some((c) => c.key === saved.sk && c.sort)) {
+          setSortKey(saved.sk);
+          setSortDir(saved.sd === "desc" ? "desc" : "asc");
+        }
+      }
+    } catch {}
+    setReady(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    if (!ready) return;
+    try {
+      const empty = Object.keys(values).length === 0 && perPage === DEFAULT_PER_PAGE && sortKey === (defaultSort?.key ?? "") && sortDir === (defaultSort?.dir ?? "asc") && (!canCustomize || (order.length === 0 && Object.keys(vis).length === 0)) && (!canCustomize || (JSON.stringify(look) === JSON.stringify(BASE_LOOK) && Object.keys(colW).length === 0 && JSON.stringify(colors) === JSON.stringify(presetColors ?? {}))) && cardsPref === null;
+      if (empty) localStorage.removeItem(STORAGE);
+      else localStorage.setItem(STORAGE, JSON.stringify({ v: values, pp: perPage, sk: sortKey, sd: sortDir, co: canCustomize ? order : [], cv: canCustomize ? vis : {}, ...(canCustomize ? { lk: look } : {}), ...(canCustomize && Object.keys(colW).length ? { cw: colW } : {}), ...(canCustomize && JSON.stringify(colors) !== JSON.stringify(presetColors ?? {}) ? { cc: colors } : {}), ...(cardsPref === null ? {} : { cm: cardsPref }) } satisfies Persisted));
+    } catch {}
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [values, perPage, sortKey, sortDir, order, vis, look, cardsPref, colW, colors, ready, STORAGE, defaultSort]);
+
+  // Închide fereastra „Coloane" la click în afara ei sau la Escape.
+  useEffect(() => {
+    if (!colsOpen) return;
+    const onDown = (e: MouseEvent) => { if (!colsBox.current?.contains(e.target as Node)) setColsOpen(false); };
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setColsOpen(false);
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => { document.removeEventListener("mousedown", onDown); document.removeEventListener("keydown", onKey); };
+  }, [colsOpen]);
+
+  // Înălțimea zonei vizibile a tabelului (pentru fereastra de randare).
+  useEffect(() => {
+    const el = scrollBox.current;
+    if (!el) return;
+    const upd = () => setVwin((v) => (v.h === el.clientHeight || el.clientHeight === 0 ? v : { ...v, h: el.clientHeight }));
+    upd();
+    const obs = new ResizeObserver(upd);
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [cards]);
+
+  // Coloanele cu etichetă (reordonabile/ascunse) + cele fixe (fără etichetă: butoane/acțiuni) rămase la început/sfârșit.
+  const firstLabeled = columns.findIndex((c) => c.label !== "");
+  const fixedStart = columns.filter((c, i) => c.label === "" && i < firstLabeled);
+  const fixedEnd = columns.filter((c, i) => c.label === "" && i > firstLabeled);
+  const labeled = columns.filter((c) => c.label !== "");
+  const orderedLabeled = useMemo(() => {
+    const idx = new Map(order.map((k, i) => [k, i]));
+    return [...labeled].sort((a, b) => (idx.get(a.key) ?? 1e6 + labeled.indexOf(a)) - (idx.get(b.key) ?? 1e6 + labeled.indexOf(b)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [columns, order]);
+  const isVisible = (c: Col<T>) => vis[c.key] ?? !c.defaultHidden;
+  const visibleCols = [...fixedStart, ...orderedLabeled.filter(isVisible), ...fixedEnd];
+  const cardFields = (() => {
+    const vis = orderedLabeled.filter(isVisible);
+    if (!cardKeys?.length) return vis;
+    const first = cardKeys.map((k) => vis.find((c) => c.key === k)).filter((c): c is Col<T> => !!c);
+    return [...first, ...vis.filter((c) => !first.includes(c))];
+  })();
+  const cardActions = [...fixedStart, ...fixedEnd];
+  const sortableCols = labeled.filter((c) => c.sort);
+  // Lățimi explicite pentru FIECARE coloană (colgroup + table-layout: fixed), scalate cu „Lățime celule": așa setarea chiar schimbă tabelul,
+  // indiferent de conținut. Baza = minW, iar la coloanele cu maxW (text lung, tăiat cu „…") media dintre minW și maxW.
+  const colWidths = visibleCols.map((c) => colW[c.key] ?? Math.round((c.maxW ? (c.minW + c.maxW) / 2 : c.minW) * look.width / 100));
+  const tableMinWidth = colWidths.reduce((a, b) => a + b, 0);
+  const roomy = look.density === "roomy";
+  // Setările implicite păstrează comportamentul clasic (coloanele își iau lățimea din conținut). Lățimile explicite se aplică doar când
+  // alegi altă lățime sau rânduri spațioase — exact cazurile în care setarea trebuie să se vadă.
+  const fixed = look.width !== 100 || roomy || Object.keys(colW).length > 0;
+
+  /**
+   * Redimensionare ca la ClickUp: tragi marginea din dreapta a antetului. Prima dată, lățimile curente ale TUTUR coloanelor se „înghesuie” (se măsoară) ca tabelul să nu sară
+   * la trecerea pe lățimi fixe; apoi coloana trasă urmărește cursorul. Dublu-click pe margine = lățimea implicită a acelei coloane.
+   */
+  function startResize(e: React.PointerEvent, key: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    const head = headRef.current;
+    if (!head) return;
+    resizing.current = true;
+    const measured: Record<string, number> = {};
+    head.querySelectorAll<HTMLElement>("th[data-ck]").forEach((th) => {
+      measured[th.dataset.ck as string] = Math.round(th.getBoundingClientRect().width);
+    });
+    const base = { ...measured, ...colW };
+    const startX = e.clientX;
+    const startW = base[key] ?? MIN_COL_W;
+    let raf = 0;
+    let latest = startW;
+    const apply = () => {
+      raf = 0;
+      setColW({ ...base, [key]: latest });
+    };
+    const move = (ev: PointerEvent) => {
+      latest = Math.min(MAX_COL_W, Math.max(MIN_COL_W, Math.round(startW + ev.clientX - startX)));
+      if (!raf) raf = requestAnimationFrame(apply);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
+      if (raf) cancelAnimationFrame(raf);
+      setColW({ ...base, [key]: latest });
+      setTimeout(() => { resizing.current = false; }, 0);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", up);
+  }
+  function resetColW(key: string) {
+    setColW((w) => {
+      const n = { ...w };
+      delete n[key];
+      return n;
+    });
+  }
+
+  /** Mută coloana `from` înaintea coloanei `to` (drag & drop) sau cu un pas (▲▼). */
+  function moveCol(from: string, to: string) {
+    if (from === to) return;
+    const keys = orderedLabeled.map((c) => c.key);
+    keys.splice(keys.indexOf(from), 1);
+    keys.splice(keys.indexOf(to), 0, from);
+    setOrder(keys);
+  }
+  function stepCol(key: string, dir: -1 | 1) {
+    const keys = orderedLabeled.map((c) => c.key);
+    const i = keys.indexOf(key);
+    const j = i + dir;
+    if (j < 0 || j >= keys.length) return;
+    [keys[i], keys[j]] = [keys[j], keys[i]];
+    setOrder(keys);
+  }
+
+  function setValue(key: string, value: string) {
+    setValues((v) => {
+      const next = { ...v };
+      if (value) next[key] = value;
+      else delete next[key];
+      return next;
+    });
+    setPage(1);
+  }
+  // Variantă stabilă pentru selectoarele memoizate (folosește doar setteri, deci nu are dependențe).
+  const pickFilter = useCallback((key: string, value: string) => {
+    setValues((v) => {
+      const next = { ...v };
+      if (value) next[key] = value;
+      else delete next[key];
+      return next;
+    });
+    setDraft((d) => ({ ...d, [key]: value }));
+    setPage(1);
+  }, []);
+
+  function onText(key: string, value: string) {
+    setDraft((d) => ({ ...d, [key]: value }));
+    clearTimeout(timers.current[key]);
+    timers.current[key] = setTimeout(() => setValue(key, value.trim()), 120);
+  }
+
+  function clearAll() {
+    Object.values(timers.current).forEach((t) => clearTimeout(t));
+    setValues({});
+    setDraft({});
+    setSortKey(defaultSort?.key ?? "");
+    setSortDir(defaultSort?.dir ?? "asc");
+    setPage(1);
+  }
+
+  function toggleSort(key: string) {
+    if (sortKey === key) setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    else { setSortKey(key); setSortDir("asc"); }
+    setPage(1);
+  }
+
+  // ── Sortare (o singură dată) + filtrare, în memorie ──
+  // Sortarea depinde doar de rânduri și de cheia/direcția aleasă (nu de identitatea `columns`, recreată la fiecare randare): cheile se calculează
+  // o dată per rând, apoi se sortează indicii. Filtrarea rulează apoi pe lista deja sortată, deci scrisul în căutare nu mai sortează nimic.
+  // `useDeferredValue`: câmpurile (selectoare, text) răspund imediat, iar lista se recalculează imediat după, fără să blocheze scrierea.
+  const sortSpec = useDeferredValue(`${sortKey}|${sortDir}`);
+  const sortedRows = useMemo(() => {
+    const sepAt = sortSpec.lastIndexOf("|");
+    const key = sortSpec.slice(0, sepAt);
+    const col = columns.find((c) => c.key === key && c.sort);
+    if (!col?.sort) return rows;
+    const dir = sortSpec.slice(sepAt + 1) === "asc" ? 1 : -1;
+    const n = rows.length;
+    const keys: (string | number | null | undefined)[] = new Array(n);
+    for (let i = 0; i < n; i++) keys[i] = col.sort(rows[i]);
+    const idx = new Array<number>(n);
+    for (let i = 0; i < n; i++) idx[i] = i;
+    idx.sort((a, b) => {
+      const x = keys[a];
+      const y = keys[b];
+      const xe = x == null || x === "";
+      const ye = y == null || y === "";
+      if (xe && ye) return 0;
+      if (xe) return 1; // fără valoare → la final, indiferent de direcție
+      if (ye) return -1;
+      if (typeof x === "number" && typeof y === "number") return (x - y) * dir;
+      return collator.compare(String(x), String(y)) * dir;
+    });
+    return idx.map((i) => rows[i]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, sortSpec]);
+  const dvalues = useDeferredValue(values);
+  const filtered = useMemo(() => {
+    const active = filters
+      .map((f) => ({ f, v: f.kind === "text" ? (dvalues[f.key] ?? "").toLowerCase() : (dvalues[f.key] ?? "") }))
+      .filter((x) => x.v);
+    return active.length ? sortedRows.filter((r) => active.every(({ f, v }) => f.test(r, v))) : sortedRows;
+  }, [sortedRows, filters, dvalues]);
+
+  const total = filtered.length;
+  const totalPages = Math.max(1, Math.ceil(total / perPage));
+  const curPage = Math.min(page, totalPages);
+  const pageRows = filtered.slice((curPage - 1) * perPage, curPage * perPage);
+  const virt = !cards && pageRows.length > VIRT_MIN;
+  const winStart = virt ? Math.min(Math.max(0, Math.floor(vwin.top / rowH) - VIRT_OVER), Math.max(0, pageRows.length - 1)) : 0;
+  const winEnd = virt ? Math.min(pageRows.length, Math.ceil((vwin.top + vwin.h) / rowH) + VIRT_OVER) : pageRows.length;
+  const shownRows = virt ? pageRows.slice(winStart, winEnd) : pageRows;
+  const from = total === 0 ? 0 : (curPage - 1) * perPage + 1;
+  const to = Math.min(curPage * perPage, total);
+  const activeCount = Object.keys(draft).filter((k) => draft[k]).length;
+  const hideRows = !!pending && activeCount > 0;
+  const sortedByUser = sortKey !== (defaultSort?.key ?? "") || sortDir !== (defaultSort?.dir ?? "asc");
+
+  // Lățimi stabile la derulare: într-o listă lungă doar rândurile din zona vizibilă există în DOM, iar în layout-ul automat lățimea unei coloane depinde de conținutul lor —
+  // fără corecție, coloanele se lărgeau / strângeau pe măsură ce derulai. Lățimea de pornire a fiecărei coloane se estimează din conținutul TUTUROR rândurilor paginii (nu doar din cele
+  // vizibile), între minim și maxim; în plus se reține cea mai mare lățime văzută (crește, nu mai scade) — deci lățimile rămân fixe la derulare.
+  const [grown, setGrown] = useState<Record<string, number>>({});
+  const naturalW = useMemo(() => {
+    const o: Record<string, number> = {};
+    if (!virt) return o;
+    for (const c of visibleCols) {
+      if (!c.sort) continue;
+      let mx = 0;
+      for (const r of pageRows) {
+        const v = c.sort(r);
+        if (v == null) continue;
+        const len = typeof v === "number" ? Math.min(String(v).length, 9) : Math.min(String(v).length, 400);
+        if (len > mx) mx = len;
+      }
+      o[c.key] = Math.ceil(mx * look.font * 0.56) + 16;
+    }
+    return o;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [virt, pageRows, columns, order, vis, look.font]);
+  useEffect(() => {
+    if (!virt || fixed) return;
+    const id = requestAnimationFrame(() => {
+      const ths = headRef.current?.querySelectorAll<HTMLElement>("th[data-ck]");
+      if (!ths) return;
+      let next: Record<string, number> | null = null;
+      ths.forEach((th) => {
+        const k = th.dataset.ck as string;
+        const w = Math.ceil(th.getBoundingClientRect().width);
+        if (w > (grown[k] ?? 0) + 1) (next ??= { ...grown })[k] = w;
+      });
+      if (next) setGrown(next);
+    });
+    return () => cancelAnimationFrame(id);
+  });
+
+  // Înălțimea reală a unui rând = media celor randate (aspectul — densitate, font — o schimbă); se măsoară după fiecare mutare a ferestrei.
+  useEffect(() => {
+    if (!virt) return;
+    const id = requestAnimationFrame(() => {
+      const trs = scrollBox.current?.querySelectorAll<HTMLElement>("tbody tr[data-vr]");
+      if (!trs || trs.length === 0) return;
+      let sum = 0;
+      const n = Math.min(trs.length, 12);
+      for (let i = 0; i < n; i++) sum += trs[i].getBoundingClientRect().height;
+      const avg = sum / n;
+      if (avg > 4) setRowH((cur) => (Math.abs(cur - avg) > 0.4 ? avg : cur));
+    });
+    return () => cancelAnimationFrame(id);
+  }, [virt, winStart, look.density, look.font, look.width]);
+
+  // Filtru/sortare/pagină noi → înapoi sus (altfel poziția veche ar cădea într-o listă mai scurtă).
+  const resetKey = `${curPage}|${perPage}|${sortSpec}|${JSON.stringify(dvalues)}`;
+  useEffect(() => {
+    if (scrollBox.current) scrollBox.current.scrollTop = 0; // declanșează onScroll → fereastra revine sus
+  }, [resetKey]);
+
+
+  return (
+    <div>
+      <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
+        {filters.length > 0 && <FiltersToggle open={fOpen} onToggle={toggleF} activeCount={activeCount} />}
+        {fOpen && filters.map((f) =>
+          f.kind === "select" ? (
+            <FilterSelect key={f.key} fkey={f.key} label={f.label} options={f.options} value={values[f.key] ?? ""} onPick={pickFilter} />
+          ) : f.kind === "date" ? (
+            <DateFilterInput key={f.key} label={t(f.label)} value={values[f.key] ?? ""} onChange={(e) => { setValue(f.key, e.target.value); setDraft((d) => ({ ...d, [f.key]: e.target.value })); }} title={t(f.label)} aria-label={t(f.label)} className={txtFld(values[f.key] ?? "")} />
+          ) : (
+            <input
+              key={f.key}
+              value={draft[f.key] ?? ""}
+              onChange={(e) => onText(f.key, e.target.value)}
+              placeholder={t(f.placeholder ?? f.label)}
+              aria-label={t(f.label)}
+              style={f.w ? { width: f.w } : undefined}
+              className={`${txtFld(draft[f.key] ?? "")} ${f.grow ? "min-w-48 flex-1" : f.w ? "" : "w-40"}`}
+            />
+          ),
+        )}
+        {(activeCount > 0 || sortedByUser) && (
+          <button type="button" onClick={clearAll} className="tap h-7 cursor-pointer rounded-lg border border-[var(--color-line)] px-2 text-[11px] text-ink-soft hover:bg-[var(--color-surface-2)]">
+            {t("Resetează filtrele")}{activeCount > 0 ? ` (${activeCount})` : ""}
+          </button>
+        )}
+        {toolbar && <div className="ml-auto flex flex-wrap items-center gap-1.5">{typeof toolbar === "function" ? toolbar({
+          filtered: !pending && filtered.length !== rows.length,
+          getIds: () => filtered.map((r) => r.id),
+          count: filtered.length,
+          // filtrele active, ca text („Status: Finalizat”), pentru antetul rapoartelor
+          describeFilters: () => filters.flatMap((f) => {
+            const v = values[f.key];
+            if (!v) return [];
+            return [`${f.label}: ${f.kind === "select" ? (f.options.find((o) => o.value === v)?.label ?? v) : f.kind === "date" ? v.split("-").reverse().join(".") : v}`];
+          }),
+        }) : toolbar}</div>}
+      </div>
+
+      <div className="mb-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs">
+        <span><b>{nf(pending && activeCount === 0 ? pending.total : total)}</b> {noun ?? t("elemente")}{activeCount > 0 ? ` ${t("(filtrat)")}` : ""}</span>
+        {pending && <span className="animate-pulse text-ink-soft">{t("se încarcă lista completă…")}</span>}
+        {total > 0 && !hideRows && <span className="text-ink-soft">{t("afișați {from}–{to} din {total}", { from: nf(from), to: nf(to), total: nf(total) })}{totalPages > 1 ? ` · ${t("pagina {cur}/{pages}", { cur: curPage, pages: totalPages })}` : ""}</span>}
+        {summaryExtra?.(filtered)}
+        {cards && sortableCols.length > 0 && (
+          <label className="flex items-center gap-1 text-xs text-ink-soft">
+            {t("Sortare")}
+            <select
+              value={sortKey}
+              onChange={(e) => { setSortKey(e.target.value); setSortDir("asc"); setPage(1); }}
+              className={fld(sortedByUser ? "x" : "")}
+              aria-label={t("Sortare")}
+            >
+              {!sortableCols.some((c) => c.key === sortKey) && <option value="">—</option>}
+              {sortableCols.map((c) => <option key={c.key} value={c.key}>{t(c.label)}</option>)}
+            </select>
+            <button type="button" onClick={() => { setSortDir((d) => (d === "asc" ? "desc" : "asc")); setPage(1); }} className="tap h-7 w-7 cursor-pointer rounded-lg border border-[var(--color-line)] text-[11px] hover:bg-[var(--color-surface-2)]" aria-label={t("Direcția sortării")} title={sortDir === "asc" ? t("Crescător") : t("Descrescător")}>
+              {sortDir === "asc" ? "▲" : "▼"}
+            </button>
+          </label>
+        )}
+        <div className="ml-auto flex items-center gap-1.5">
+        <button
+          type="button"
+          onClick={() => setCardsPref(!cards)}
+          className={`tap h-7 cursor-pointer rounded-lg border px-2 text-[11px] ${cards ? "border-brand bg-brand/10 font-semibold text-brand" : "border-[var(--color-line)] bg-[var(--color-surface)] text-ink-soft hover:bg-[var(--color-surface-2)]"}`}
+          title={cards ? t("Înapoi la tabel") : t("Afișează rândurile într-o coloană mică; apeși pe un rând ca să vezi detaliile (potrivit pentru telefon)")}
+          aria-pressed={cards}
+        >
+          {cards ? `▦ ${t("Tabel")}` : `📱 ${t("Mod telefon")}`}
+        </button>
+        {canCustomize && (
+        <div ref={colsBox} className="relative">
+          <button
+            type="button"
+            onClick={() => setColsOpen((o) => !o)}
+            className={`tap h-7 cursor-pointer rounded-lg border px-2 text-[11px] ${order.length || Object.keys(vis).length || Object.keys(colW).length || hasColors(colors) || JSON.stringify(look) !== JSON.stringify(BASE_LOOK) ? "border-brand bg-brand/10 font-semibold text-brand" : "border-[var(--color-line)] bg-[var(--color-surface)] text-ink-soft hover:bg-[var(--color-surface-2)]"}`}
+            title={t("Alege și ordonează coloanele")}
+          >
+            ⚙ {t("Coloane")}
+          </button>
+          {colsOpen && (
+            <>
+            {/* Telefon: foaie fixă în josul ecranului (derulabilă), cu fundal care se închide la atingere — meniul nu mai iese din ecran. De la sm în sus: dropdown sub buton. */}
+            <div className="fixed inset-0 z-40 bg-black/40 sm:hidden" onClick={() => setColsOpen(false)} aria-hidden />
+            <div className="fixed inset-x-2 bottom-2 z-50 max-h-[82dvh] overflow-y-auto overscroll-contain rounded-xl border border-[var(--color-line)] bg-[var(--color-surface)] p-2 shadow-xl sm:absolute sm:inset-x-auto sm:bottom-auto sm:right-0 sm:top-full sm:mt-1 sm:max-h-[min(75dvh,40rem)] sm:w-72 sm:max-w-[calc(100vw-1.5rem)]">
+              <div className="sticky -top-2 z-10 -mx-2 -mt-2 mb-1 flex items-center justify-between bg-[var(--color-surface)] px-3 py-2 sm:hidden">
+                <span className="text-sm font-bold">{t("Coloane")}</span>
+                <button type="button" onClick={() => setColsOpen(false)} className="tap h-8 cursor-pointer rounded-lg bg-brand px-3 text-xs font-semibold text-white">{t("Gata")}</button>
+              </div>
+              <p className="mb-1 px-1 text-[10px] text-ink-soft">{t("Bifează ce vrei să vezi; mută cu ▲▼ sau trage antetele din tabel.")}</p>
+              <ul className="max-h-56 overflow-auto sm:max-h-56">
+                {orderedLabeled.map((c, i) => (
+                  <li key={c.key} className="flex items-center gap-1.5 rounded px-1 py-0.5 text-[12px] hover:bg-[var(--color-surface-2)]">
+                    <input type="checkbox" checked={isVisible(c)} onChange={(e) => setVis((v) => ({ ...v, [c.key]: e.target.checked }))} className="size-3.5 cursor-pointer accent-[var(--color-brand)]" />
+                    <span className="min-w-0 flex-1 truncate">{t(c.label)}{c.defaultHidden ? <span className="ml-1 text-[10px] text-ink-soft">{t("(în plus)")}</span> : null}</span>
+                    <button type="button" disabled={i === 0} onClick={() => stepCol(c.key, -1)} className="grid size-5 cursor-pointer place-items-center rounded text-[10px] hover:bg-brand-soft disabled:opacity-30" aria-label={t("Mai sus")}>▲</button>
+                    <button type="button" disabled={i === orderedLabeled.length - 1} onClick={() => stepCol(c.key, 1)} className="grid size-5 cursor-pointer place-items-center rounded text-[10px] hover:bg-brand-soft disabled:opacity-30" aria-label={t("Mai jos")}>▼</button>
+                  </li>
+                ))}
+              </ul>
+              <div className="mt-2 border-t border-[var(--color-line)] pt-2">
+                <p className="mb-1 px-1 text-[10px] font-semibold uppercase tracking-wide text-ink-soft">{t("Aspect")}</p>
+                <div className="grid grid-cols-2 gap-x-2 gap-y-1.5 px-1 text-[11px]">
+                  <LookSelect label={t("Rânduri")} value={look.density} onChange={(v) => setLook({ ...look, density: v })} options={[["compact", t("Compacte")], ["normal", t("Normale")], ["roomy", t("Spațioase")]]} />
+                  <LookSelect label={t("Text")} value={String(look.font)} onChange={(v) => setLook({ ...look, font: Number(v) as Look["font"] })} options={[["10", t("Mic")], ["11", t("Normal")], ["13", t("Mare")], ["15", t("Foarte mare")]]} />
+                  <label className="flex cursor-pointer items-end gap-1.5 pb-1">
+                    <input type="checkbox" checked={look.zebra} onChange={(e) => setLook({ ...look, zebra: e.target.checked })} className="size-3.5 cursor-pointer accent-[var(--color-brand)]" />
+                    {t("Rânduri alternate")}
+                  </label>
+                </div>
+                <p className="mt-1.5 px-1 text-[10px] leading-snug text-ink-soft">
+                  {t("Lățimea unei coloane se schimbă trăgând de marginea antetului. Textul care nu încape se taie cu „…”; la „Rânduri spațioase” se rupe pe până la 3 rânduri.")}
+                </p>
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-1.5">
+                <button type="button" onClick={() => { setColorsOpen(true); setColsOpen(false); }} className={`tap h-7 cursor-pointer rounded-lg border text-[11px] ${hasColors(colors) ? "border-brand bg-brand/10 font-semibold text-brand" : "border-[var(--color-line)] hover:bg-[var(--color-surface-2)]"}`}>
+                  🎨 {t("Culori…")}
+                </button>
+                <button type="button" disabled={Object.keys(colW).length === 0} onClick={() => setColW({})} className="tap h-7 cursor-pointer rounded-lg border border-[var(--color-line)] text-[11px] hover:bg-[var(--color-surface-2)] disabled:cursor-default disabled:opacity-40" title={t("Revine la lățimile implicite ale coloanelor")}>
+                  ↔ {t("Resetează lățimile")}
+                </button>
+              </div>
+              <button type="button" onClick={() => { setOrder([]); setVis({}); setLook(BASE_LOOK); setColW({}); setColors(presetColors ?? {}); }} className="tap mt-1.5 h-7 w-full cursor-pointer rounded-lg border border-[var(--color-line)] text-[11px] hover:bg-[var(--color-surface-2)]">
+                {t("Resetează coloanele și aspectul")}
+              </button>
+            </div>
+            </>
+          )}
+          {colorsOpen && <TableColorsDialog value={colors} onChange={setColors} onClose={() => setColorsOpen(false)} />}
+        </div>
+        )}
+        </div>
+        <label className="flex items-center gap-1.5 text-xs text-ink-soft">
+          {t("Afișează")}
+          <select
+            value={perPage}
+            onChange={(e) => { setPerPage(Number(e.target.value)); setPage(1); }}
+            className={fld(perPage === DEFAULT_PER_PAGE ? "" : "x")}
+            aria-label={t("Rânduri pe pagină")}
+          >
+            {NOTIFY_PER_PAGE.map((n) => <option key={n} value={n}>{perPageLabel(n, t)}</option>)}
+          </select>
+        </label>
+      </div>
+
+      {hideRows ? (
+        <div className="card animate-pulse p-8 text-center text-ink-soft">{t("Se încarcă lista completă… filtrele se aplică imediat ce e gata.")}</div>
+      ) : cards ? (
+        <div className={`flex flex-col gap-1.5 ${TEXT_CLS[look.text]}`}>
+          {(() => {
+            const renderCard = (r: T) => {
+            // Rezumat: primele trei coloane vizibile (titlu + două valori scurte); restul se vede la desfacere.
+            const [c0, c1, c2, ...rest] = cardFields;
+            const initial = cardAvatar ? cardAvatar(r) : String(c0?.sort?.(r) ?? "").trim().charAt(0).toUpperCase();
+            const rcCard = rowColor?.(r);
+            const cardEl = (
+              <CompactCard
+                key={r.id}
+                avatar={initial}
+                title={c0 ? c0.render(r) : r.id}
+                subtitle={[c1, c2].filter((c): c is Col<T> => !!c).map((c, i) => (
+                  <span key={c.key} className="inline-flex min-w-0 items-center gap-1">
+                    {i > 0 && <span className="text-ink-soft/50">·</span>}
+                    {c.render(r)}
+                  </span>
+                ))}
+                className={rowClassName?.(r) ?? ""}
+              >
+                {rest.length > 0 && (
+                  <dl>
+                    {rest.map((c) => <CompactField key={c.key} label={t(c.label)}>{c.render(r)}</CompactField>)}
+                  </dl>
+                )}
+                {(cardActions.length > 0 || onRowClick) && (
+                  <div className="flex flex-wrap items-center gap-2 px-2.5 py-1.5 text-[12px]">
+                    {onRowClick && (
+                      <button type="button" onClick={() => onRowClick(r)} className="tap h-7 cursor-pointer rounded-lg bg-brand px-3 text-[11px] font-semibold text-white hover:bg-brand-strong">
+                        {t("Deschide")}
+                      </button>
+                    )}
+                    {cardActions.map((c) => <span key={c.key}>{c.render(r)}</span>)}
+                  </div>
+                )}
+              </CompactCard>
+            );
+            return rcCard ? <div key={r.id} style={{ borderLeft: `4px solid ${rcCard}`, borderRadius: 12 }}>{cardEl}</div> : cardEl;
+            };
+            // Multe carduri (de ex. „Toate”): doar cele din zona vizibilă există în DOM.
+            return pageRows.length > 60
+              ? <VirtualList count={pageRows.length} itemKey={(i) => pageRows[i].id} render={(i) => renderCard(pageRows[i])} estimate={52} />
+              : pageRows.map(renderCard);
+          })()}
+          {pageRows.length === 0 && (
+            <div className="card p-8 text-center text-ink-soft">
+              {activeCount > 0 ? t("Nimic cu filtrele acestea.") : (emptyText ?? t("Nimic de afișat."))}{" "}
+              {activeCount > 0 && <button type="button" onClick={clearAll} className="cursor-pointer font-semibold text-brand underline">{t("Resetează filtrele")}</button>}
+            </div>
+          )}
+        </div>
+      ) : (
+      <div
+        ref={scrollBox}
+        className="card dt-root overflow-auto"
+        style={{ maxHeight: perPage > 50 ? "max(78vh, 890px)" : undefined, ...colorVars(colors) }}
+        onScroll={virt ? (e) => {
+          const top = e.currentTarget.scrollTop;
+          if (scrollRaf.current) return;
+          scrollRaf.current = requestAnimationFrame(() => {
+            scrollRaf.current = 0;
+            // rotunjit la 6 rânduri: nu randăm din nou la fiecare pixel derulat
+            const q = Math.floor(top / (rowH * 6)) * rowH * 6;
+            setVwin((v) => (v.top === q ? v : { ...v, top: q }));
+          });
+        } : undefined}
+      >
+        <table
+          className={`${fixed ? "" : "w-max min-w-full"} border-separate border-spacing-0 ${TEXT_CLS[look.text]}`}
+          style={{
+            ...(fixed ? { tableLayout: "fixed" as const, width: "100%", minWidth: tableMinWidth } : {}),
+            fontSize: look.font,
+            lineHeight: `${Math.round(look.font * 1.3) + (roomy ? 4 : look.density === "normal" ? 2 : 0)}px`,
+          }}
+        >
+          {fixed && (
+            <colgroup>
+              {visibleCols.map((c, i) => <col key={c.key} style={{ width: colWidths[i] }} />)}
+            </colgroup>
+          )}
+          <thead ref={headRef} className={`sticky top-0 z-20 ${HEADER_CLS[look.header]}`} style={headStyle(colors)}>
+            <tr>
+              {visibleCols.map((c, ci) => (
+                <th
+                  key={c.key}
+                  data-ck={c.key}
+                  style={{ ...(fixed ? {} : { minWidth: virt ? Math.max(Math.round(Math.min(Math.max(naturalW[c.key] ?? 0, c.minW), c.maxW ?? Infinity) * look.width / 100), grown[c.key] ?? 0) : Math.round(c.minW * look.width / 100) }), ...headStyle(colors) }}
+                  draggable={c.label !== "" && canCustomize}
+                  onDragStart={(e) => { if (resizing.current) { e.preventDefault(); return; } setDragKey(c.key); e.dataTransfer.effectAllowed = "move"; e.dataTransfer.setData("text/plain", c.key); }}
+                  onDragOver={(e) => { if (dragKey && c.label !== "") { e.preventDefault(); setOverKey(c.key); } }}
+                  onDragLeave={() => setOverKey((k) => (k === c.key ? null : k))}
+                  onDrop={(e) => { e.preventDefault(); if (dragKey) moveCol(dragKey, c.key); setDragKey(null); setOverKey(null); }}
+                  onDragEnd={() => { setDragKey(null); setOverKey(null); }}
+                  title={c.label !== "" && canCustomize ? t("Trage ca să muți coloana") : undefined}
+                  className={`relative ${fixed ? "overflow-hidden" : ""} border-b border-[var(--color-line)] ${HEADER_CLS[look.header]} ${DENSITY[look.density].px} ${DENSITY[look.density].head} font-semibold leading-tight ${c.right ? "text-right" : "text-left"} ${c.sticky && ci <= 1 ? "sticky left-0 z-30" : ""} ${c.label !== "" && canCustomize ? "cursor-grab" : ""} ${overKey === c.key && dragKey !== c.key ? "shadow-[inset_3px_0_0_var(--color-brand)]" : ""} ${dragKey === c.key ? "opacity-50" : ""}`}
+                >
+                  {c.sort ? (
+                    <button type="button" onClick={() => toggleSort(c.key)} className="inline-flex cursor-pointer items-center gap-1 font-semibold hover:text-brand">
+                      {t(c.label)}
+                      <span className="text-[10px] opacity-60">{sortKey === c.key ? (sortDir === "asc" ? "▲" : "▼") : "↕"}</span>
+                    </button>
+                  ) : t(c.label)}
+                  {c.label !== "" && canCustomize && (
+                    <span
+                      role="separator"
+                      aria-orientation="vertical"
+                      aria-label={t("Trage ca să schimbi lățimea coloanei")}
+                      title={t("Trage ca să schimbi lățimea coloanei (dublu-click = implicit)")}
+                      draggable={false}
+                      onPointerDown={(e) => startResize(e, c.key)}
+                      onDoubleClick={() => resetColW(c.key)}
+                      className="dt-resize absolute right-0 top-0 z-10 h-full w-2 cursor-col-resize select-none hover:bg-brand/40"
+                    />
+                  )}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {virt && winStart > 0 && (
+              <tr aria-hidden="true"><td colSpan={visibleCols.length} style={{ height: winStart * rowH, padding: 0, border: 0 }} /></tr>
+            )}
+            {shownRows.map((r, rj) => {
+              const ri = winStart + rj;
+              return (
+              <tr
+                key={r.id}
+                data-vr=""
+                data-rc={rowColor?.(r) ? "" : undefined}
+                style={rowColor?.(r) ? ({ "--dt-rc": rowColor(r) } as React.CSSProperties) : undefined}
+                onClick={onRowClick ? (e) => { if (rowClickSkipsControls && (e.target as HTMLElement).closest("button, a, select, input, textarea, label, [role=button], [role=combobox], [data-no-row]")) return; onRowClick(r); } : undefined}
+                className={`${onRowClick ? "cursor-pointer" : ""} hover:bg-brand-soft/30 ${rowClassName?.(r) ?? ""}`}
+              >
+                {visibleCols.map((c, ci) => (
+                  <td
+                    key={c.key}
+                    style={!fixed && c.maxW ? { maxWidth: Math.round(c.maxW * look.width / 100) } : undefined}
+                    className={`${fixed ? "overflow-hidden" : ""} border-b border-[var(--color-line)] ${look.zebra && ri % 2 === 1 ? ZEBRA_BG : "bg-[var(--dt-row,var(--color-surface))]"} ${DENSITY[look.density].px} ${DENSITY[look.density].cell} ${fixed && !roomy ? "whitespace-nowrap" : ""} ${c.right ? "text-right tabular-nums" : ""} ${c.sticky && ci <= 1 ? "sticky left-0 z-10 font-medium" : ""}`}
+                  >
+                    {/* Rânduri compacte/normale: o singură linie, textul lung se taie cu „…". Spațioase: textul se rupe pe până la 3 rânduri. */}
+                    {/* coloanele de control (fără titlu: culoare, deschide, acțiuni) nu se taie și nu au clip: altfel inelul de hover / cercul de culoare se ciunt */}
+                    {(c.maxW || roomy) && c.label ? <div className={`${roomy ? "line-clamp-3 break-words" : "truncate"} -mx-0.5 -my-0.5 px-0.5 py-0.5`}>{c.render(r)}</div> : c.render(r)}
+                  </td>
+                ))}
+              </tr>
+              );
+            })}
+            {virt && winEnd < pageRows.length && (
+              <tr aria-hidden="true"><td colSpan={visibleCols.length} style={{ height: (pageRows.length - winEnd) * rowH, padding: 0, border: 0 }} /></tr>
+            )}
+            {pageRows.length === 0 && (
+              <tr>
+                <td colSpan={visibleCols.length} className="p-8 text-center text-ink-soft">
+                  {activeCount > 0 ? t("Nimic cu filtrele acestea.") : (emptyText ?? t("Nimic de afișat."))}{" "}
+                  {activeCount > 0 && <button type="button" onClick={clearAll} className="cursor-pointer font-semibold text-brand underline">{t("Resetează filtrele")}</button>}
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+      )}
+
+      {total > 0 && totalPages > 1 && !hideRows && (
+        <div className="mt-3 flex flex-wrap items-center justify-center gap-1">
+          <button disabled={curPage <= 1} onClick={() => setPage(curPage - 1)} className="tap grid size-7 cursor-pointer place-items-center rounded-lg border border-[var(--color-line)] text-ink-soft hover:bg-[var(--color-surface-2)] disabled:cursor-default disabled:opacity-40" aria-label={t("Pagina anterioară")}>
+            <IconChevronLeft className="size-4" />
+          </button>
+          {buildPageButtons(curPage, totalPages).map((b, i) =>
+            b === "…" ? (
+              <span key={`e${i}`} className="flex h-7 w-6 items-center justify-center text-sm text-ink-soft">…</span>
+            ) : (
+              <button key={b} onClick={() => setPage(b)} className={`tap h-7 min-w-[28px] cursor-pointer rounded-lg px-2 text-xs font-medium ${b === curPage ? "bg-brand text-white" : "border border-[var(--color-line)] text-ink hover:bg-[var(--color-surface-2)]"}`}>
+                {b}
+              </button>
+            ),
+          )}
+          <button disabled={curPage >= totalPages} onClick={() => setPage(curPage + 1)} className="tap grid size-7 cursor-pointer place-items-center rounded-lg border border-[var(--color-line)] text-ink-soft hover:bg-[var(--color-surface-2)] disabled:cursor-default disabled:opacity-40" aria-label={t("Pagina următoare")}>
+            <IconChevronRight className="size-4" />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LookSelect<V extends string>({
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  label: string;
+  value: V | string;
+  options: [string, string][];
+  onChange: (v: V) => void;
+}) {
+  return (
+    <label className="flex flex-col gap-0.5 text-ink-soft">
+      {label}
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value as V)}
+        className="h-7 cursor-pointer rounded-lg border border-[var(--color-line)] bg-[var(--color-surface)] px-1 text-[11px] text-ink outline-none focus:border-brand"
+      >
+        {options.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+      </select>
+    </label>
+  );
+}
+
+function buildPageButtons(current: number, total: number): (number | "…")[] {
+  if (total <= 7) return Array.from({ length: total }, (_, i) => i + 1);
+  const pages = new Set<number>([1, total]);
+  for (let i = Math.max(2, current - 2); i <= Math.min(total - 1, current + 2); i++) pages.add(i);
+  const sorted = [...pages].sort((a, b) => a - b);
+  const out: (number | "…")[] = [];
+  for (let i = 0; i < sorted.length; i++) {
+    if (i > 0 && sorted[i] - sorted[i - 1] > 1) out.push("…");
+    out.push(sorted[i]);
+  }
+  return out;
+}

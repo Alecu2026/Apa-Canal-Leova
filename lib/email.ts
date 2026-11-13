@@ -1,0 +1,618 @@
+import "server-only";
+import nodemailer, { type Transporter } from "nodemailer";
+import { env } from "./env";
+import { prisma } from "./prisma";
+import { logDelivery, withDeliveryMeta, wrapMailTransport, type DeliveryMeta } from "./delivery-log";
+
+let cached: Transporter | null = null;
+
+function getTransporter(): Transporter | null {
+  if (!env.smtp.enabled) return null;
+  if (!cached) {
+    cached = wrapMailTransport(
+      nodemailer.createTransport({
+        host: env.smtp.host,
+        port: env.smtp.port,
+        secure: env.smtp.secure,
+        auth: { user: env.smtp.user, pass: env.smtp.pass },
+      }),
+    );
+  }
+  return cached;
+}
+
+export type ReminderEmailData = {
+  to: string;
+  clientName: string;
+  service: string;
+  date: string;
+  time: string;
+  fromName?: string | null;
+  fromAddr?: string | null;
+};
+
+const escHtml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function template(raw: ReminderEmailData): string {
+  const d = { ...raw, clientName: escHtml(raw.clientName), service: escHtml(raw.service), date: escHtml(raw.date), time: escHtml(raw.time) };
+  return `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:480px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+        <tr><td style="background:#0d9488;padding:20px 24px;color:#fff;font-size:18px;font-weight:700">
+          Reminder programare
+        </td></tr>
+        <tr><td style="padding:24px">
+          <p style="margin:0 0 14px;font-size:16px">Bună, <b>${d.clientName}</b>.</p>
+          <p style="margin:0 0 18px;font-size:15px;line-height:1.5">
+            Ai programare la <b>${d.service}</b> pe <b>${d.date}</b> la <b>${d.time}</b>.
+          </p>
+          <div style="background:#ccfbf1;border-radius:12px;padding:14px 16px;margin-bottom:18px">
+            <div style="font-size:13px;color:#0f766e">📅 ${d.date} &nbsp; 🕐 ${d.time}</div>
+          </div>
+          <p style="margin:0;font-size:14px;color:#475569">
+            Te rugăm să confirmi dacă poți ajunge.
+          </p>
+        </td></tr>
+        <tr><td style="padding:14px 24px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">
+          Mesaj automat — te rugăm să nu răspunzi.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
+export type TaskReminderEmailData = {
+  to: string;
+  userName: string;
+  taskTitle: string;
+  seq: number | null | undefined;
+  taskUrl: string;
+  isOverdue?: boolean;
+  /** Numele companiei din Setări (antetul emailului); lipsă → „Apă-Canal Cahul”. */
+  companyName?: string | null;
+};
+
+function taskReminderTemplate(raw: TaskReminderEmailData): string {
+  const d = { ...raw, userName: escHtml(raw.userName), taskTitle: escHtml(raw.taskTitle), taskUrl: escHtml(raw.taskUrl) };
+  const company = escHtml(raw.companyName?.trim() || "Apă-Canal Cahul");
+  const badge = d.isOverdue
+    ? `<div style="background:#fee2e2;border-radius:8px;padding:10px 14px;margin-bottom:16px;color:#991b1b;font-weight:600">⏰ Sarcină în întârziere</div>`
+    : `<div style="background:#ede9fe;border-radius:8px;padding:10px 14px;margin-bottom:16px;color:#5b21b6;font-weight:600">🔔 Reamintire sarcină</div>`;
+  const ref = d.seq != null ? ` <span style="color:#6366f1">#${d.seq}</span>` : "";
+  return `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:480px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+        <tr><td style="background:#6366f1;padding:20px 24px;color:#fff;font-size:18px;font-weight:700">
+          ${company}
+        </td></tr>
+        <tr><td style="padding:24px">
+          <p style="margin:0 0 14px;font-size:16px">Bună, <b>${d.userName}</b>.</p>
+          ${badge}
+          <p style="margin:0 0 18px;font-size:15px;line-height:1.5">
+            Task-ul <b>${d.taskTitle}</b>${ref} necesită atenția ta.
+          </p>
+          <a href="${d.taskUrl}" style="display:inline-block;background:#6366f1;color:#fff;text-decoration:none;padding:12px 20px;border-radius:10px;font-weight:600">
+            Deschide task
+          </a>
+        </td></tr>
+        <tr><td style="padding:14px 24px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">
+          Mesaj automat — te rugăm să nu răspunzi.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
+async function sendTaskReminderEmailImpl(d: TaskReminderEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  const from = env.smtp.from;
+  const companyName =
+    d.companyName ??
+    (await prisma.companySettings.findUnique({ where: { singleton: "main" }, select: { companyName: true } }).catch(() => null))?.companyName;
+  const subject = d.isOverdue ? `⏰ Sarcină în întârziere: ${d.taskTitle}` : `🔔 Reamintire sarcină: ${d.taskTitle}`;
+  await transporter.sendMail({
+    from,
+    to: d.to,
+    subject,
+    text: `Bună, ${d.userName}. Sarcina „${d.taskTitle}"${d.seq != null ? ` (#${d.seq})` : ""} necesită atenția ta. ${d.taskUrl}`,
+    html: taskReminderTemplate({ ...d, companyName }),
+  });
+}
+
+export type InvoiceEmailData = {
+  to: string;
+  clientName: string;
+  invoiceNumber: string;
+  grandTotal: number;
+  currency: string;
+  dueDate: Date | null;
+  publicUrl: string;
+  companyName?: string | null;
+  fromName?: string | null;
+  fromAddr?: string | null;
+};
+
+function invoiceTemplate(d: InvoiceEmailData): string {
+  const fmt = (n: number) =>
+    n.toLocaleString("ro-RO", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const dueLine = d.dueDate
+    ? `<p style="margin:0 0 8px;font-size:14px;color:#475569">Scadență: <b>${d.dueDate.toLocaleDateString("ro-RO")}</b></p>`
+    : "";
+  const company = d.companyName ? `<b>${d.companyName}</b>` : "furnizorul dumneavoastră";
+  return `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+        <tr><td style="background:#6366f1;padding:20px 28px;color:#fff;font-size:19px;font-weight:700">
+          🧾 Factură nouă
+        </td></tr>
+        <tr><td style="padding:28px">
+          <p style="margin:0 0 16px;font-size:16px">Bună, <b>${d.clientName}</b>.</p>
+          <p style="margin:0 0 20px;font-size:15px;line-height:1.6">
+            ${company} v-a emis o factură nouă.
+          </p>
+          <div style="background:#f1f5f9;border-radius:12px;padding:18px 20px;margin-bottom:24px">
+            <p style="margin:0 0 8px;font-size:14px;color:#475569">Nr. factură: <b>${d.invoiceNumber}</b></p>
+            ${dueLine}
+            <p style="margin:0;font-size:18px;font-weight:700;color:#0f172a">
+              Total: ${fmt(d.grandTotal)} ${d.currency}
+            </p>
+          </div>
+          <a href="${d.publicUrl}" style="display:inline-block;background:#6366f1;color:#fff;text-decoration:none;padding:13px 24px;border-radius:10px;font-weight:600;font-size:15px">
+            Vizualizează factura
+          </a>
+        </td></tr>
+        <tr><td style="padding:14px 28px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">
+          Mesaj automat — te rugăm să nu răspunzi la acest email.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
+async function sendInvoiceEmailImpl(d: InvoiceEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  const from =
+    d.fromName && d.fromAddr ? `${d.fromName} <${d.fromAddr}>` : env.smtp.from;
+  const subject = d.companyName
+    ? `Factură ${d.invoiceNumber} — ${d.companyName}`
+    : `Factură ${d.invoiceNumber}`;
+  await transporter.sendMail({
+    from,
+    to: d.to,
+    subject,
+    text: `Bună, ${d.clientName}. Aveți o factură nouă (${d.invoiceNumber}) în valoare de ${d.grandTotal} ${d.currency}. Vizualizați: ${d.publicUrl}`,
+    html: invoiceTemplate(d),
+  });
+}
+
+export type VerificationCodeEmailData = {
+  to: string;
+  name: string;
+  code: string;
+  purpose: "PASSWORD_CHANGE" | "PASSWORD_RESET" | "CLIENT_REGISTRATION" | "CLIENT_PASSWORD_RESET";
+};
+
+function verificationCodeTemplate(d: VerificationCodeEmailData): string {
+  const title =
+    d.purpose === "PASSWORD_RESET" || d.purpose === "CLIENT_PASSWORD_RESET"
+      ? "Resetare parolă"
+      : d.purpose === "CLIENT_REGISTRATION"
+        ? "Activare cont"
+        : "Schimbare parolă";
+  const desc =
+    d.purpose === "PASSWORD_RESET" || d.purpose === "CLIENT_PASSWORD_RESET"
+      ? "Ai cerut resetarea parolei contului tău. Folosește codul de mai jos pentru a continua."
+      : d.purpose === "CLIENT_REGISTRATION"
+        ? "Ai cerut activarea contului tău în portalul de clienți. Folosește codul de mai jos pentru a continua."
+        : "Ai cerut schimbarea parolei contului tău. Folosește codul de mai jos pentru a confirma.";
+  return `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:480px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+        <tr><td style="background:#0d9488;padding:20px 24px;color:#fff;font-size:18px;font-weight:700">
+          🔐 ${title}
+        </td></tr>
+        <tr><td style="padding:28px">
+          <p style="margin:0 0 16px;font-size:16px">Bună, <b>${d.name}</b>.</p>
+          <p style="margin:0 0 20px;font-size:15px;line-height:1.6">${desc}</p>
+          <div style="background:#f1f5f9;border-radius:12px;padding:20px;margin-bottom:20px;text-align:center">
+            <span style="font-size:32px;font-weight:700;letter-spacing:8px;color:#0f766e">${d.code}</span>
+          </div>
+          <p style="margin:0;font-size:13px;color:#64748b">Codul expiră în 15 minute. Dacă nu ai cerut tu această acțiune, ignoră acest email.</p>
+        </td></tr>
+        <tr><td style="padding:14px 24px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">
+          Mesaj automat — te rugăm să nu răspunzi.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
+async function sendVerificationCodeEmailImpl(d: VerificationCodeEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  const subject =
+    d.purpose === "PASSWORD_RESET" || d.purpose === "CLIENT_PASSWORD_RESET"
+      ? "Codul tău de resetare parolă"
+      : d.purpose === "CLIENT_REGISTRATION"
+        ? "Codul tău de activare cont"
+        : "Codul tău de schimbare parolă";
+  await transporter.sendMail({
+    from: env.smtp.from,
+    to: d.to,
+    subject,
+    text: `Bună, ${d.name}. Codul tău este: ${d.code} (expiră în 15 minute).`,
+    html: verificationCodeTemplate(d),
+  });
+}
+
+export type NewDeviceEmailData = { to: string; name: string; when: string; browser: string; os: string; ip: string | null; securityUrl: string };
+
+async function sendNewDeviceEmailImpl(d: NewDeviceEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  const esc = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  await transporter.sendMail({
+    from: env.smtp.from,
+    to: d.to,
+    subject: "Autentificare nouă în contul tău",
+    text: `Bună, ${d.name}. Contul tău a fost folosit de pe un dispozitiv nou: ${d.browser}, ${d.os}${d.ip ? `, adresa ${d.ip}` : ""}, ${d.when}. Dacă ai fost tu, nu trebuie să faci nimic. Dacă nu, schimbă parola și deconectează celelalte sesiuni: ${d.securityUrl}`,
+    html: `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0"><tr><td align="center">
+    <table role="presentation" width="100%" style="max-width:480px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+      <tr><td style="background:#0d9488;padding:20px 24px;color:#fff;font-size:18px;font-weight:700">🔐 Autentificare nouă în contul tău</td></tr>
+      <tr><td style="padding:28px">
+        <p style="margin:0 0 16px;font-size:16px">Bună, <b>${esc(d.name)}</b>.</p>
+        <p style="margin:0 0 16px;font-size:15px;line-height:1.6">Contul tău a fost folosit de pe un dispozitiv pe care nu îl mai folosise până acum:</p>
+        <table role="presentation" style="background:#f1f5f9;border-radius:12px;padding:14px 18px;margin-bottom:18px;font-size:14px;line-height:1.7">
+          <tr><td style="color:#64748b;padding-right:14px">Dispozitiv</td><td><b>${esc(d.browser)}, ${esc(d.os)}</b></td></tr>
+          <tr><td style="color:#64748b;padding-right:14px">Adresă IP</td><td><b>${esc(d.ip ?? "necunoscută")}</b></td></tr>
+          <tr><td style="color:#64748b;padding-right:14px">Moment</td><td><b>${esc(d.when)}</b></td></tr>
+        </table>
+        <p style="margin:0 0 14px;font-size:14px;line-height:1.6">Dacă ai fost tu, nu trebuie să faci nimic. Dacă <b>nu ai fost tu</b>, schimbă parola imediat și deconectează celelalte sesiuni din Setări → Securitate.</p>
+        <p style="margin:0"><a href="${esc(d.securityUrl)}" style="display:inline-block;background:#0d9488;color:#fff;text-decoration:none;padding:10px 18px;border-radius:10px;font-weight:600">Deschide Securitate</a></p>
+      </td></tr>
+      <tr><td style="padding:14px 24px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">Mesaj automat — te rugăm să nu răspunzi.</td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`,
+  });
+}
+
+export type ReadingVerifyEmailData = {
+  to: string;
+  name: string;
+  contor: string;
+  address: string | null;
+  period: string;
+  value: number;
+  prevValue: number | null;
+  consum: number | null;
+  /** indexul de dinainte de modificare; null = citire nouă */
+  oldValue: number | null;
+  when: string;
+  /** modificarea a făcut-o plătitorul însuși (în portal) sau un angajat al companiei */
+  byClient: boolean;
+  url: string;
+  company: string;
+  /** Citirea NU e încă înregistrată: emailul cere confirmarea, iar abia după ea citirea contează. */
+  pending?: boolean;
+};
+
+const m3 = (n: number) => n.toLocaleString("ro-RO", { maximumFractionDigits: 3 });
+
+function readingVerifyTemplate(d: ReadingVerifyEmailData): string {
+  const esc = (v: string) => v.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const edited = d.oldValue != null;
+  const introRo = d.pending
+    ? "Ați trimis prin portalul clienților indexul contorului. Citirea va fi înregistrată abia după ce o confirmați prin butonul de mai jos — până atunci ea nu este trimisă."
+    : !edited
+    ? "Am primit prin portalul clienților indexul contorului dumneavoastră. Vă rugăm să verificați că este corect."
+    : d.byClient
+      ? "Indexul contorului dumneavoastră a fost modificat în portalul clienților. Vă rugăm să verificați că noua valoare este corectă."
+      : "Un angajat al companiei a corectat indexul contorului dumneavoastră. Vă rugăm să verificați că noua valoare este corectă.";
+  const introRu = d.pending
+    ? "Вы передали показания счётчика через портал. Они будут зарегистрированы только после подтверждения кнопкой ниже — до этого момента они не отправлены."
+    : !edited
+    ? "Через портал клиентов получены показания вашего счётчика. Пожалуйста, проверьте, что они верны."
+    : d.byClient
+      ? "Показания вашего счётчика были изменены в портале клиентов. Пожалуйста, проверьте, что новое значение верно."
+      : "Сотрудник компании исправил показания вашего счётчика. Пожалуйста, проверьте, что новое значение верно.";
+  const row = (a: string, b: string, v: string) => `<tr><td style="color:#64748b;padding:2px 14px 2px 0">${a}<br><span style="font-size:11px">${b}</span></td><td><b>${v}</b></td></tr>`;
+  return `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0"><tr><td align="center">
+    <table role="presentation" width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+      <tr><td style="background:#0d9488;padding:18px 24px;color:#fff;font-size:17px;font-weight:700">${d.pending ? "💧 Confirmați citirea / Подтвердите показания" : edited ? "✏️ Citire modificată / Показания изменены" : "💧 Verificați citirea / Проверьте показания"}</td></tr>
+      <tr><td style="padding:24px">
+        <p style="margin:0 0 12px;font-size:15px">Stimate(ă) <b>${esc(d.name)}</b>,</p>
+        <p style="margin:0 0 14px;font-size:14px;line-height:1.6">${introRo}</p>
+        <p style="margin:0 0 14px;font-size:13px;line-height:1.6;color:#475569">${introRu}</p>
+        <table role="presentation" style="background:#f1f5f9;border-radius:12px;padding:12px 16px;margin-bottom:18px;font-size:14px;line-height:1.5">
+          ${row("Contor", "Счётчик", esc(d.contor))}
+          ${d.address ? row("Adresa", "Адрес", esc(d.address)) : ""}
+          ${row("Luna", "Месяц", esc(d.period))}
+          ${edited ? row("Index anterior trimis", "Прежнее значение", `<s>${m3(d.oldValue!)} m³</s>`) : ""}
+          ${row(edited ? "Index nou" : "Index trimis", edited ? "Новое значение" : "Переданные показания", `${m3(d.value)} m³`)}
+          ${d.consum != null ? row("Consum față de citirea anterioară", "Расход", `${m3(d.consum)} m³`) : ""}
+          ${row("Data și ora", "Дата и время", esc(d.when))}
+        </table>
+        <p style="margin:0 0 16px"><a href="${esc(d.url)}" style="display:inline-block;background:#0d9488;color:#fff;text-decoration:none;padding:12px 22px;border-radius:10px;font-weight:600">${d.pending ? "Confirm citirea / Подтверждаю показания" : "Verifică citirea / Проверить показания"}</a></p>
+        ${d.pending ? `<p style="margin:0;font-size:12px;line-height:1.6;color:#64748b">Dacă nu ați trimis dumneavoastră această citire, ignorați emailul — nu se înregistrează nimic. Linkul este valabil 7 zile.<br>Если вы не передавали эти показания, просто проигнорируйте письмо — ничего не будет зарегистрировано. Ссылка действительна 7 дней.</p>` : `<p style="margin:0;font-size:12px;line-height:1.6;color:#64748b">Pe pagina deschisă puteți <b>confirma</b> valoarea sau o puteți <b>contesta</b> dacă nu este corectă ori nu dumneavoastră ați transmis-o. Linkul este valabil 14 zile.<br>На открывшейся странице вы можете <b>подтвердить</b> значение или <b>оспорить</b> его, если оно неверно или вы его не передавали. Ссылка действительна 14 дней.</p>`}
+      </td></tr>
+      <tr><td style="padding:12px 24px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">${esc(d.company)} · Mesaj automat — vă rugăm să nu răspundeți.</td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`;
+}
+
+async function sendReadingVerificationEmailImpl(d: ReadingVerifyEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  const edited = d.oldValue != null;
+  await transporter.sendMail({
+    from: env.smtp.from,
+    to: d.to,
+    subject: d.pending ? `Confirmați citirea contorului ${d.contor} / Подтвердите показания счётчика ${d.contor}` : edited ? `Citirea contorului ${d.contor} a fost modificată / Показания счётчика ${d.contor} изменены` : `Verificați citirea contorului ${d.contor} / Проверьте показания счётчика ${d.contor}`,
+    text: d.pending ? `Stimate(ă) ${d.name}, ați trimis indexul contorului ${d.contor} (${d.period}): ${m3(d.value)} m³. Citirea se înregistrează abia după confirmare: ${d.url}` : `Stimate(ă) ${d.name}, indexul contorului ${d.contor} (${d.period}) este ${m3(d.value)} m³${edited ? ` (înainte: ${m3(d.oldValue!)} m³)` : ""}. Verificați și confirmați sau contestați: ${d.url}`,
+    html: readingVerifyTemplate(d),
+  });
+}
+
+/** Trimite reminder-ul. Aruncă eroare la eșec (pentru logica de retry). */
+async function sendReminderEmailImpl(d: ReminderEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+
+  const from =
+    d.fromName && d.fromAddr
+      ? `${d.fromName} <${d.fromAddr}>`
+      : env.smtp.from;
+
+  await transporter.sendMail({
+    from,
+    to: d.to,
+    subject: "Reminder programare",
+    text: `Bună, ${d.clientName}. Ai programare la ${d.service} pe ${d.date} la ${d.time}. Te rugăm să confirmi dacă poți ajunge.`,
+    html: template(d),
+  });
+}
+
+export type PayerNotificationEmailData = {
+  to: string;
+  subject: string;
+  /** Text simplu, cu rânduri noi — se escapează și se afișează cu <br>. */
+  body: string;
+  companyName?: string | null;
+  /** Tipul din Jurnalul de notificări (implicit „Notificare plătitori”): expirarea contractului, verificarea metrologică, termenul unei nereguli au tipul lor. */
+  deliveryKind?: string;
+};
+
+const escapeHtml = (s: string) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function payerNotificationTemplate(d: PayerNotificationEmailData): string {
+  const company = d.companyName ? escapeHtml(d.companyName) : "Apă-Canal";
+  // Linkurile din mesaj (ex. {link} = factura) devin clicabile; textul a fost deja escapat, deci adresa e sigură în atribut.
+  // Punctuația de după adresă („…{link}." sau „({link})") nu face parte din ea: o scoatem din link și o lăsăm ca text.
+  const body = escapeHtml(d.body)
+    .replace(/https?:\/\/[^\s<]+/g, (m) => {
+      const url = m.replace(/(?:&quot;|&#39;|[.,;:!?)\]}])+$/, "");
+      return `<a href="${url}" style="color:#0d9488;font-weight:600;word-break:break-all">${url}</a>${m.slice(url.length)}`;
+    })
+    .replace(/\r?\n/g, "<br>");
+  return `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+        <tr><td style="background:#0d9488;padding:20px 28px;color:#fff;font-size:19px;font-weight:700">
+          ${company}
+        </td></tr>
+        <tr><td style="padding:28px;font-size:15px;line-height:1.6">
+          ${body}
+        </td></tr>
+        <tr><td style="padding:14px 28px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">
+          Mesaj automat de la ${company} — te rugăm să nu răspunzi la acest email.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+}
+
+/** Notificare către un plătitor (din /notificari-platitori). Aruncă eroare la eșec. */
+async function sendPayerNotificationEmailImpl(d: PayerNotificationEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  await transporter.sendMail({
+    from: env.smtp.from,
+    to: d.to,
+    subject: d.subject,
+    text: d.body,
+    html: payerNotificationTemplate(d),
+  });
+}
+
+export type TicketMessageEmailData = {
+  to: string;
+  clientName: string;
+  ticketTitle: string;
+  seq: number | null;
+  /** Numele operatorului care a scris. */
+  authorName: string;
+  message: string;
+  /** Linkul spre conversație în portal. */
+  url: string;
+  companyName?: string | null;
+};
+
+/**
+ * Email către client: „ai primit un mesaj nou la tichetul tău" — cu începutul mesajului și un buton spre conversația din portal,
+ * unde poate răspunde. Aruncă eroare la eșec; apelantul decide ce face (conversația se salvează oricum).
+ */
+async function sendTicketMessageEmailImpl(d: TicketMessageEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  const company = escapeHtml(d.companyName?.trim() || "Apă-Canal");
+  const ref = d.seq != null ? `#${d.seq}` : "";
+  const excerpt = d.message.length > 700 ? `${d.message.slice(0, 700)}…` : d.message;
+  const subject = `Răspuns la cererea ${ref} ${d.ticketTitle}`.replace(/\s+/g, " ").trim().slice(0, 200);
+  const text = [
+    `Bună ziua, ${d.clientName},`,
+    "",
+    `Ai primit un mesaj nou la cererea ${ref} „${d.ticketTitle}” de la ${d.authorName}:`,
+    "",
+    excerpt,
+    "",
+    `Poți răspunde direct aici: ${d.url}`,
+  ].join("\n");
+  const html = `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+        <tr><td style="background:#0d9488;padding:20px 28px;color:#fff;font-size:19px;font-weight:700">${company}</td></tr>
+        <tr><td style="padding:28px;font-size:15px;line-height:1.6">
+          <p style="margin:0 0 6px">Bună ziua, <b>${escapeHtml(d.clientName)}</b>,</p>
+          <p style="margin:0 0 16px;color:#475569">Ai primit un mesaj nou la cererea <b>${escapeHtml(ref)} ${escapeHtml(d.ticketTitle)}</b>:</p>
+          <div style="background:#f1f5f9;border-radius:14px;padding:14px 16px;margin:0 0 20px">
+            <div style="font-size:12px;color:#64748b;margin-bottom:4px">${escapeHtml(d.authorName)}</div>
+            <div>${escapeHtml(excerpt).replace(/\r?\n/g, "<br>")}</div>
+          </div>
+          <a href="${escapeHtml(d.url)}" style="display:inline-block;background:#0d9488;color:#fff;text-decoration:none;font-weight:600;padding:12px 22px;border-radius:12px">Deschide conversația și răspunde</a>
+        </td></tr>
+        <tr><td style="padding:14px 28px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">
+          Mesaj automat de la ${company}. Răspunde din conversația din portal, nu la acest email.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+  await transporter.sendMail({ from: env.smtp.from, to: d.to, subject, text, html });
+}
+
+export type TicketResolvedEmailData = {
+  to: string;
+  clientName: string;
+  ticketTitle: string;
+  seq: number | null;
+  /** DONE = executată; CANCELLED = închisă fără execuție. */
+  outcome: "DONE" | "CANCELLED";
+  /** „YYYY-MM-DD” — data executării, dacă e setată. */
+  executedOn: string | null;
+  /** „Măsuri luate” și timpul de rezolvare (minute), dacă au fost completate. */
+  measures?: string | null;
+  minutes?: number | null;
+  /** Linkul spre cerere în portal. */
+  url: string;
+  companyName?: string | null;
+};
+
+/**
+ * Email către client: cererea lui din portal a fost rezolvată (executată sau închisă). Română și rusă în același mesaj; butonul duce la cerere în portal, unde
+ * poate vedea detaliile și poate scrie dacă ceva nu e în regulă. Aruncă eroare la eșec; apelantul decide ce face.
+ */
+async function sendTicketResolvedEmailImpl(d: TicketResolvedEmailData): Promise<void> {
+  const transporter = getTransporter();
+  if (!transporter) throw new Error("SMTP neconfigurat.");
+  const company = d.companyName?.trim() || "Apă-Canal";
+  const ref = d.seq != null ? `#${d.seq}` : "";
+  const date = d.executedOn ? d.executedOn.split("-").reverse().join(".") : null;
+  const done = d.outcome === "DONE";
+  const roLine = done
+    ? `Cererea ta ${ref} „${d.ticketTitle}” a fost executată${date ? ` la data de ${date}` : ""}.`
+    : `Cererea ta ${ref} „${d.ticketTitle}” a fost închisă fără execuție.`;
+  const ruLine = done
+    ? `Ваша заявка ${ref} «${d.ticketTitle}» выполнена${date ? ` (${date})` : ""}.`
+    : `Ваша заявка ${ref} «${d.ticketTitle}» закрыта без выполнения.`;
+  const took = d.minutes != null ? `${Math.floor(d.minutes / 60) ? `${Math.floor(d.minutes / 60)} h ` : ""}${d.minutes % 60 || !Math.floor(d.minutes / 60) ? `${d.minutes % 60} min` : ""}`.trim() : null;
+  const measuresRo = done && d.measures ? `Măsuri luate: ${d.measures}${took ? ` (timp de rezolvare: ${took})` : ""}` : null;
+  const measuresRu = done && d.measures ? `Принятые меры: ${d.measures}${took ? ` (время решения: ${took})` : ""}` : null;
+  const subject = (done ? `Cererea ${ref} a fost executată / Заявка ${ref} выполнена` : `Cererea ${ref} a fost închisă / Заявка ${ref} закрыта`).replace(/\s+/g, " ").trim().slice(0, 200);
+  const text = [
+    `Bună ziua, ${d.clientName},`,
+    "",
+    roLine,
+    ...(measuresRo ? [measuresRo] : []),
+    `Detalii și conversație: ${d.url}`,
+    "Dacă ceva nu e în regulă, scrie-ne în conversația cererii.",
+    ...(done ? ["Ne ajută părerea ta: dă o notă rezolvării (1–5) pe pagina cererii din portal."] : []),
+    "",
+    "— — —",
+    "",
+    `Здравствуйте, ${d.clientName},`,
+    "",
+    ruLine,
+    ...(measuresRu ? [measuresRu] : []),
+    `Подробности и переписка: ${d.url}`,
+    "Если что-то не так, напишите нам в переписке по заявке.",
+    ...(done ? ["Нам важно ваше мнение: оцените решение (1–5) на странице заявки в портале."] : []),
+  ].join("\n");
+  const html = `<!doctype html>
+<html lang="ro"><body style="margin:0;background:#f5f6f8;font-family:Segoe UI,Arial,sans-serif;color:#0f172a">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0">
+    <tr><td align="center">
+      <table role="presentation" width="100%" style="max-width:520px;background:#fff;border-radius:16px;overflow:hidden;border:1px solid #e2e8f0">
+        <tr><td style="background:#0d9488;padding:20px 28px;color:#fff;font-size:19px;font-weight:700">${escapeHtml(company)}</td></tr>
+        <tr><td style="padding:28px;font-size:15px;line-height:1.6">
+          <p style="margin:0 0 12px">Bună ziua, <b>${escapeHtml(d.clientName)}</b>,</p>
+          <p style="margin:0 0 6px;font-size:16px"><b>${done ? "✓ " : ""}${escapeHtml(roLine)}</b></p>
+          ${measuresRo ? `<p style="margin:0 0 6px;background:#f1f5f9;border-radius:10px;padding:10px 12px">${escapeHtml(measuresRo).replace(/\r?\n/g, "<br>")}</p>` : ""}
+          <p style="margin:0 0 ${done ? 6 : 18}px;color:#475569">Dacă ceva nu e în regulă, scrie-ne în conversația cererii.</p>
+          ${done ? `<p style="margin:0 0 18px;color:#0f172a">⭐ Ne ajută părerea ta: dă o notă rezolvării (1–5) pe pagina cererii din portal.</p>` : ""}
+          <p style="margin:0 0 6px;font-size:16px"><b>${done ? "✓ " : ""}${escapeHtml(ruLine)}</b></p>
+          ${measuresRu ? `<p style="margin:0 0 6px;background:#f1f5f9;border-radius:10px;padding:10px 12px">${escapeHtml(measuresRu).replace(/\r?\n/g, "<br>")}</p>` : ""}
+          <p style="margin:0 0 ${done ? 6 : 20}px;color:#475569">Если что-то не так, напишите нам в переписке по заявке.</p>
+          ${done ? `<p style="margin:0 0 20px;color:#0f172a">⭐ Нам важно ваше мнение: оцените решение (1–5) на странице заявки в портале.</p>` : ""}
+          <a href="${escapeHtml(d.url)}" style="display:inline-block;background:#0d9488;color:#fff;text-decoration:none;font-weight:600;padding:12px 22px;border-radius:12px">Deschide cererea / Открыть заявку</a>
+        </td></tr>
+        <tr><td style="padding:14px 28px;border-top:1px solid #e2e8f0;font-size:12px;color:#94a3b8">
+          Mesaj automat de la ${escapeHtml(company)}. / Автоматическое сообщение.
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body></html>`;
+  await transporter.sendMail({ from: env.smtp.from, to: d.to, subject, text, html });
+}
+
+// ── Jurnal: fiecare trimitere de email intră în jurnal (cu tipul ei și destinatarul); fără SMTP configurat se notează „omis”. ──
+async function logged<D extends { to: string }>(d: D, meta: DeliveryMeta, send: (d: D) => Promise<void>): Promise<void> {
+  if (!env.smtp.enabled) await logDelivery({ ...meta, channel: "EMAIL", status: "SKIPPED", to: d.to, error: "SMTP neconfigurat." });
+  return withDeliveryMeta({ ...meta, toName: meta.toName }, () => send(d));
+}
+const idFromUrl = (url: string, seg: string) => new RegExp(`/${seg}/([0-9a-f]{24})`, "i").exec(url)?.[1] ?? null;
+
+export const sendTaskReminderEmail = (d: TaskReminderEmailData) =>
+  logged(d, { kind: d.isOverdue ? "task.overdue" : "task.reminder", toName: d.userName, objectType: "task", objectId: idFromUrl(d.taskUrl, "tasks"), objectName: d.taskTitle }, sendTaskReminderEmailImpl);
+export const sendInvoiceEmail = (d: InvoiceEmailData) =>
+  logged(d, { kind: "invoice.email", toName: d.clientName, objectType: "invoice", objectName: d.invoiceNumber }, sendInvoiceEmailImpl);
+export const sendVerificationCodeEmail = (d: VerificationCodeEmailData) =>
+  logged(d, { kind: "verification.code", toName: d.name, objectName: d.purpose }, sendVerificationCodeEmailImpl);
+export const sendNewDeviceEmail = (d: NewDeviceEmailData) =>
+  logged(d, { kind: "auth.new_device", toName: d.name }, sendNewDeviceEmailImpl);
+export const sendReadingVerificationEmail = (d: ReadingVerifyEmailData) =>
+  logged(d, { kind: d.pending ? "reading.confirm" : "reading.verify", toName: d.name, objectType: "meter", objectName: d.contor }, sendReadingVerificationEmailImpl);
+export const sendReminderEmail = (d: ReminderEmailData) =>
+  logged(d, { kind: "appointment.reminder", toName: d.clientName, objectType: "appointment", objectName: d.service }, sendReminderEmailImpl);
+export const sendPayerNotificationEmail = (d: PayerNotificationEmailData) =>
+  logged(d, { kind: d.deliveryKind || "payer.campaign" }, sendPayerNotificationEmailImpl);
+export const sendTicketResolvedEmail = (d: TicketResolvedEmailData) =>
+  logged(d, { kind: "ticket.resolved", toName: d.clientName, objectType: "ticket", objectId: idFromUrl(d.url, "portal/cereri"), objectName: d.ticketTitle }, sendTicketResolvedEmailImpl);
+export const sendTicketMessageEmail = (d: TicketMessageEmailData) =>
+  logged(d, { kind: "ticket.message", toName: d.clientName, objectType: "ticket", objectId: idFromUrl(d.url, "tickets"), objectName: d.ticketTitle }, sendTicketMessageEmailImpl);

@@ -1,0 +1,1675 @@
+// Prisma schema — MongoDB
+// Optimizat pentru viteză: select peste tot în query-uri, indexuri compuse,
+// snapshot-uri denormalizate pe Appointment pentru listări fără join (ex. Telegram).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+enum UserRole {
+  ADMIN
+  STAFF
+}
+
+enum AppointmentStatus {
+  NEW
+  CONFIRMED
+  IN_PROGRESS
+  DONE
+  CANCELLED
+  NO_SHOW
+}
+
+enum CreatedFrom {
+  WEB
+  TELEGRAM
+  VOICE
+}
+
+enum ReminderType {
+  EMAIL
+  TELEGRAM
+  PWA
+}
+
+enum ReminderStatus {
+  PENDING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum NotificationChannel {
+  EMAIL
+  TELEGRAM
+  PWA
+}
+
+enum VoiceSource {
+  WEB
+  TELEGRAM
+}
+
+enum VoiceStatus {
+  TRANSCRIBED
+  PARSED
+  CONFIRMED
+  DISCARDED
+  FAILED
+}
+
+// --- Task / Ticket management ---
+
+enum TaskType {
+  TASK
+  TICKET
+  WORK_ORDER
+}
+
+enum TaskStatus {
+  NEW
+  ASSIGNED
+  READ
+  IN_PROGRESS
+  ON_HOLD
+  REVIEW
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum ProjectStatus {
+  ACTIVE
+  ON_HOLD
+  DONE
+  ARCHIVED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  CANCELLED
+  OVERDUE
+}
+
+enum InvoiceKind {
+  STANDARD
+  APA_CANAL
+}
+
+// ----------------------------------------------------------------------------
+// Models
+// ----------------------------------------------------------------------------
+
+model User {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  name         String
+  email        String   @unique
+  phone        String?
+  passwordHash String
+  role         UserRole @default(ADMIN)
+  isActive     Boolean  @default(true)
+  // Super-admin: vede Audit Logs și gestionează ceilalți super-admini (peste rolul ADMIN)
+  isSuperAdmin Boolean  @default(false)
+  // Permisiuni individuale (chei din lib/permissions.ts). ADMIN le are pe toate.
+  permissions  String[] @default([])
+  // Aspectul tabelelor setat de administrator pentru acest utilizator (densitate, mărime text, lățime, culori — vezi lib/table-look.ts). Cine are „Personalizare tabele” îl poate schimba singur.
+  tableLook    Json?
+  // Butoanele rapide din bara de jos de pe telefon, alese de utilizator în Setări (adrese din lib/nav-meta.ts, în ordine); gol = primele 5 din meniu.
+  bottomNav    String[] @default([])
+  // Evenimente la care primește notificări „observator" (chei din lib/notify-meta.ts).
+  // Listă vidă = toate evenimentele (când notifyScope permite).
+  notifyEvents String[] @default([])
+  // Chat ID Telegram setat manual de admin (pentru notificări), independent de linkarea prin bot
+  telegramChatId String?
+  // Secția din care face parte utilizatorul (Section); echipele lui sunt cele din Team.memberIds. Gol = fără secție.
+  sectionId      String? @db.ObjectId
+
+  // --- Filtrare notificări „administrator" (ce echipe/membri îl interesează) ---
+  // ALL = toate echipele/membrii; TEAMS = doar notifyTeamIds; MEMBERS = doar notifyMemberIds
+  notifyScope     String   @default("ALL")
+  notifyTeamIds   String[] @db.ObjectId
+  notifyMemberIds String[] @db.ObjectId
+
+  // --- Ce task-uri/tichete VEDE (listă, Kanban, calendar, export, fișa individuală) ---
+  // ALL = vede tot, ca până acum (implicit — niciun cont existent nu pierde acces la upgrade).
+  // RESTRICTED = doar echipele din taskViewTeamIds și persoanele din taskViewMemberIds, PLUS
+  // mereu propriile task-uri (create de el sau asignate lui) — independent de rol (și adminii
+  // pot fi restricționați, nu doar STAFF): contabilii nu trebuie să vadă task-urile de șantier.
+  taskViewScope     String   @default("ALL")
+  taskViewTeamIds   String[] @db.ObjectId
+  taskViewMemberIds String[] @db.ObjectId
+
+  // --- Autentificare în doi pași (TOTP, RFC 6238), doar la intrarea în cont ---
+  // Secretul activ, criptat (AES-GCM, lib/secret-box.ts); null = 2FA oprit.
+  totpSecret     String?
+  totpEnabledAt  DateTime?
+  // Secret generat la configurare, încă neconfirmat cu un cod (se șterge la confirmare / anulare).
+  totpPending    String?
+  // Ultimul interval de 30 s acceptat: un cod deja folosit nu mai poate fi refolosit (replay).
+  totpLastStep   Int?
+  // Coduri de recuperare: doar hash-uri sha256 (cele folosite se șterg).
+  totpRecovery   String[] @default([])
+  // Dispozitive pe care s-a mai intrat în cont (hash-ul cookie-ului de dispozitiv, ultimele ~20): o intrare dintr-un dispozitiv nou trimite o notificare.
+  knownDevices   String[] @default([])
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sessions        Session[]
+  clients         Client[]
+  appointments    Appointment[]
+  assignedAppointments Appointment[] @relation("AppointmentAssignee")
+  categories      Category[]
+  reminders       Reminder[]
+  // Listă (nu 1:1): TelegramAccount.userId NU e @unique — pe MongoDB, un index unic pe un
+  // câmp opțional ar trata toate contactele „pending" (userId absent) ca duplicate de null.
+  telegramAccounts TelegramAccount[]
+  settings        AppSettings?
+  notificationLog NotificationLog[]
+  voiceLog        VoiceCommandLog[]
+  pushSubs        PushSubscription[]
+
+  // Task management
+  teamIds        String[]      @db.ObjectId
+  teams          Team[]        @relation(fields: [teamIds], references: [id])
+  ownedProjects  Project[]     @relation("ProjectOwner")
+  createdTasks   Task[]        @relation("TaskCreator")
+  assignedTasks  Task[]        @relation("TaskAssignee")
+  taskActivities TaskActivity[]
+  taskComments    TaskComment[]
+  taskAttachments TaskAttachment[]
+  invoices       Invoice[]
+  notifications  Notification[]
+  verificationCodes VerificationCode[]
+}
+
+// Coduri de unică folosință trimise pe email (schimbare parolă / resetare parolă uitată).
+model VerificationCode {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose   String   // PASSWORD_CHANGE | PASSWORD_RESET
+  codeHash  String   // hash SHA-256 al codului din 6 cifre — codul brut nu se stochează niciodată
+  expiresAt DateTime
+  usedAt    DateTime?
+  attempts  Int?     // încercări greșite — blocat după MAX_ATTEMPTS (vezi lib/services/verification-codes.ts)
+  createdAt DateTime @default(now())
+
+  @@index([userId, purpose, createdAt])
+}
+
+model Notification {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String
+  body      String?
+  url       String?
+  taskId    String?  @db.ObjectId
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([userId, read, createdAt])
+}
+
+// Audit log — fără relație la User intenționat: logurile rămân chiar dacă userul
+// sau obiectul (task/client/proiect) e șters. Date denormalizate (snapshot).
+model AuditLog {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String?  @db.ObjectId // cine a făcut acțiunea (poate fi șters ulterior)
+  userName   String                // snapshot nume
+  userRole   String                // snapshot rol (ADMIN/STAFF, + SUPER dacă e cazul)
+  action     String                // ex: task.create, task.status_change, auth.login
+  module     String                // Tasks/Tickets/Projects/Clients/Invoices/Users/Settings/Auth/Notifications
+  objectId   String?               // id-ul obiectului afectat
+  objectName String?               // nume/titlu snapshot
+  oldValue   String?               // valoare veche (text sau JSON)
+  newValue   String?               // valoare nouă
+  ip         String?
+  userAgent  String?
+  /// detalii structurate (JSON, vezi lib/audit-meta.ts → AuditDetails): modificările pe câmpuri + informații suplimentare
+  details    String?
+  /// pagina din care s-a făcut acțiunea (calea din Referer)
+  path       String?
+  createdAt  DateTime @default(now())
+
+  @@index([objectId, createdAt])
+  @@index([createdAt])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+  @@index([module, createdAt])
+}
+
+/// Secție = nivelul de deasupra echipelor: o secție are mai multe echipe (Team.sectionId), iar fiecare utilizator face parte dintr-o secție (User.sectionId).
+/// Cererile și sarcinile au și ele o secție (Task.sectionId), completată automat din echipele / persoanele alese; pe ea se filtrează și se scot rapoartele.
+model Section {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Team {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  description String?
+  /// Secția din care face parte echipa (Section); gol = echipă fără secție.
+  sectionId   String?  @db.ObjectId
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  memberIds String[] @db.ObjectId
+  members   User[]   @relation(fields: [memberIds], references: [id])
+
+  projects Project[]
+  tasks    Task[]
+}
+
+model Project {
+  id          String        @id @default(auto()) @map("_id") @db.ObjectId
+  seq         Int?
+  name        String
+  description String?
+  status      ProjectStatus @default(ACTIVE)
+
+  ownerId String @db.ObjectId
+  owner   User   @relation("ProjectOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  // Client asociat (opțional) — folosit la facturare (lanț client→proiect→task)
+  clientId String? @db.ObjectId
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  // Asignare opțională: toate task-urile noi din proiect merg implicit la acest user/echipă
+  assigneeId String? @db.ObjectId
+  teamId     String? @db.ObjectId
+  team       Team?   @relation(fields: [teamId], references: [id], onDelete: SetNull)
+
+  // Locație (opțional)
+  address String?
+  lat     Float?
+  lng     Float?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tasks    Task[]
+  invoices Invoice[]
+
+  @@index([ownerId])
+  @@index([status])
+  @@index([clientId])
+}
+
+model Task {
+  id          String       @id @default(auto()) @map("_id") @db.ObjectId
+  // Identificator scurt, secvențial (#123), pentru afișare ușoară (UI + Telegram).
+  // Opțional în schemă fiindcă task-urile vechi nu îl au — vezi scripts/backfill-task-seq.mjs.
+  seq         Int?
+  type        TaskType     @default(TASK)
+  title       String
+  description String?
+  status      TaskStatus   @default(NEW)
+  priority    TaskPriority @default(MEDIUM)
+  progress    Int          @default(0)
+
+  creatorId String @db.ObjectId
+  creator   User   @relation("TaskCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+
+  // Asignat unui user și/sau unei echipe
+  assigneeId String? @db.ObjectId
+  assignee   User?   @relation("TaskAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  teamId     String? @db.ObjectId
+  team       Team?   @relation(fields: [teamId], references: [id], onDelete: SetNull)
+
+  // Multi-asignare: IDs suplimentari (pe lângă assigneeId/teamId primar)
+  extraAssigneeIds String[] @db.ObjectId
+  extraTeamIds     String[] @db.ObjectId
+  // JSON: [{userId?:"id", teamId?:"id", notifyUntilStatus?:"STATUS"|null}]
+  assignmentSettingsJson String?
+  // Dacă true, notificările Telegram se trimit și în orele de somn pentru acest task
+  bypassQuietHours Boolean @default(false)
+  // Culoarea rândului în liste (hex „#rrggbb”), aleasă de utilizatori cu drept de editare; gol = fără culoare.
+  color String?
+
+  projectId String?  @db.ObjectId
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  categoryId String?   @db.ObjectId
+  category   Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  // Denormalizat din project.clientId — evită JOIN la filtrare după client
+  clientId   String?   @db.ObjectId
+
+  // Adresa locului intervenției (sugerată din adresele plătitorilor la creare; text liber permis).
+  address    String?
+  /// Numele consumatorului pentru care se depune cererea (la cererile din portal: completat de client, implicit numele lui).
+  consumerName String?
+  /// Șablonul de cerere din portal din care a pornit cererea (PortalRequestTemplate); gol la cererile mai vechi sau create în CRM — pentru filtrul „Șablon din portal” din Cereri.
+  portalTemplateId String? @db.ObjectId
+  /// Șablonul intern (TaskTemplate: Setări → Șabloane) din care a fost creată cererea / sarcina în CRM, plus numele lui de atunci (rămâne la numărătoare și după ștergerea șablonului); gol = creată fără șablon sau înainte de această evidență.
+  taskTemplateId   String? @db.ObjectId
+  taskTemplateName String?
+  /// Secția cererii / sarcinii (Section): aleasă în formular sau completată automat din echipele și persoanele atribuite; gol = fără secție (cele create înainte de secții se deduc la afișare din echipă / asignat).
+  sectionId        String? @db.ObjectId
+  /// Tipul serviciului la care se referă cererea: WATER (apă), SEWER (canalizare) sau BOTH (apă + canalizare); gol = nespecificat (cererile mai vechi). Vezi lib/service-type.ts.
+  serviceType String?
+  /// Categoria consumatorului: HOUSEHOLD (casnic) sau NON_HOUSEHOLD (non casnic); gol = nespecificat. Vezi lib/consumer-type.ts.
+  consumerType String?
+  /// Data executării cererii (doar data, 00:00 UTC): completată de echipă; la finalizarea unei cereri rămâne data zilei dacă nu e deja setată.
+  executedAt DateTime?
+  /// Închiderea unei cereri: ce s-a făcut („Măsuri luate”), cât a durat rezolvarea (minute, introdus de executant) și când s-a închis (Finalizat / Anulat; gol la redeschidere).
+  measuresTaken     String?
+  /// Feedback-ul clientului după închiderea cererii (portal): nota 1–5, comentariul opțional și momentul trimiterii (ultima modificare).
+  feedbackRating  Int?
+  feedbackComment String?
+  feedbackAt      DateTime?
+  resolutionMinutes Int?
+  closedAt          DateTime?
+
+  dueAt       DateTime?
+  createdFrom CreatedFrom @default(WEB)
+
+  // id-ul mesajului trimis în Telegram asignatului (pentru editarea butoanelor)
+  telegramChatId    String?
+  telegramMessageId Int?
+
+  // Setat când s-a trimis deja notificarea de întârziere, ca să nu se repete la fiecare rulare de cron
+  overdueNotifiedAt DateTime?
+
+  // Reamintire periodică: interval în minute (null = dezactivat). nextReminderAt = ora trimiterii următoare.
+  reminderIntervalMinutes Int?
+  nextReminderAt          DateTime?
+  // Reamintire programată (alternativă la intervalul fix): o singură dată / zilnic / săptămânal / lunar / la interval personalizat, la o oră anume.
+  // JSON — vezi lib/reminder-schedule.ts. Când e setată, reminderIntervalMinutes e null; nextReminderAt = următoarea reamintire calculată din ea.
+  reminderSchedule        Json?
+
+  // Ultimul mesaj de reamintire Telegram trimis asignatului (pentru a-l șterge la reamintirea următoare)
+  reminderMsgChatId String?
+  reminderMsgId     Int?
+
+  // --- Conversație cu clientul (chat din portal ↔ operatori), vezi TicketMessage ---
+  // Ultimul mesaj și cine l-a scris ("CLIENT" | "STAFF"): din ele se deduce „mesaj nou" fără să numărăm mesajele.
+  chatLastMsgAt       DateTime?
+  chatLastSender      String?
+  // Până când a citit fiecare parte conversația (operatorii împart un singur marcaj; clientul are al lui).
+  chatStaffReadAt     DateTime?
+  chatClientReadAt    DateTime?
+  // Ultimul email de „ai primit un mesaj" trimis clientului (evităm o avalanșă de emailuri la mesaje în rafală).
+  chatClientEmailedAt DateTime?
+  ticketMessages      TicketMessage[]
+
+  // --- Email → Tichet ---
+  // Câmpuri populate când tichetul a fost creat dintr-un email primit
+  emailSource       Boolean   @default(false)
+  fromEmail         String?   // adresa expeditorului
+  fromName          String?   // numele expeditorului
+  emailMessageId    String?   // Message-ID al primului email (pentru threading)
+  emailThreadId     String?   // thread ID (= emailMessageId al primului email din conversație)
+  lastClientEmailAt DateTime? // când a scris ultima dată clientul (pt. nerăspuns + auto-close)
+  autoCloseWarnedAt DateTime? // când am trimis avertismentul de auto-închidere (2 zile)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  activities    TaskActivity[]
+  comments      TaskComment[]
+  attachments   TaskAttachment[]
+  invoices      Invoice[]
+  emailMessages EmailMessage[]
+
+  @@index([assigneeId, status])
+  @@index([creatorId, status])
+  @@index([projectId])
+  @@index([teamId, status])
+  @@index([status])
+  @@index([dueAt, status])
+  @@index([seq])
+  @@index([categoryId])
+  @@index([clientId, status])
+  @@index([extraAssigneeIds]) // „ale mele” – fără ele $or parcurge toată colecția (creat și la rulare de lib/queries/tasks.ts)
+  @@index([extraTeamIds])
+  @@index([type, status])
+  @@index([updatedAt])
+  @@index([emailThreadId])
+  @@index([emailSource, status])
+  // cron-ul de reamintiri (la 1–5 minute) caută sarcinile cu reamintire scadentă
+  @@index([nextReminderAt])
+}
+
+// Mesaje email legate de un tichet (inbound = de la client, outbound = răspuns staff)
+model EmailMessage {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  taskId    String   @db.ObjectId
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  direction String   // INBOUND | OUTBOUND
+  fromEmail String
+  fromName  String?
+  toEmail   String
+  subject   String?
+  body      String
+  messageId String?  // Message-ID header (pentru threading)
+  sentAt    DateTime @default(now())
+
+  @@index([taskId, sentAt])
+  @@index([messageId])
+}
+
+model TaskAttachment {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  taskId    String   @db.ObjectId
+  task      Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId    String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  url       String
+  size      Int
+  mimeType  String?
+  createdAt DateTime @default(now())
+
+  @@index([taskId, createdAt])
+}
+
+// Contor atomic generic (folosit pentru Task.seq) — MongoDB nu are autoincrement nativ.
+model Counter {
+  id    String @id @default(auto()) @map("_id") @db.ObjectId
+  name  String @unique
+  value Int    @default(0)
+}
+
+// Checkpoint pentru cron jobs — stochează ultima rulare per job.
+model CronState {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  key       String   @unique
+  lastRunAt DateTime @default(now())
+}
+
+model TaskComment {
+  id        String      @id @default(auto()) @map("_id") @db.ObjectId
+  taskId    String      @db.ObjectId
+  task      Task        @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId    String      @db.ObjectId
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  body      String
+  source    CreatedFrom @default(WEB)
+  createdAt DateTime    @default(now())
+
+  @@index([taskId, createdAt])
+}
+
+// Mesajele conversației unui tichet între client (din portal) și operatori — vizibile ambelor părți.
+// Separat de TaskComment, care rămâne notița INTERNĂ a echipei (clientul nu o vede).
+model TicketMessage {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  taskId     String   @db.ObjectId
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  // CLIENT = clientul din portal; STAFF = operator
+  sender     String
+  userId     String?  @db.ObjectId
+  clientId   String?  @db.ObjectId
+  authorName String
+  body       String
+  createdAt  DateTime @default(now())
+
+  @@index([taskId, createdAt])
+}
+
+model TaskActivity {
+  id         String      @id @default(auto()) @map("_id") @db.ObjectId
+  taskId     String      @db.ObjectId
+  task       Task        @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  userId     String      @db.ObjectId
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // null = STATUS_CHANGED (date vechi fără action); altfel: STATUS_CHANGED | EDITED | COMMENTED | ATTACHMENT_ADDED | ATTACHMENT_DELETED
+  action     String?
+  fromStatus TaskStatus?
+  toStatus   TaskStatus?
+  meta       Json?
+  note       String?
+  createdAt  DateTime    @default(now())
+
+  @@index([taskId, createdAt])
+}
+
+// --- Facturare ---
+
+model CompanySettings {
+  id          String  @id @default(auto()) @map("_id") @db.ObjectId
+  singleton   String  @unique @default("main") // garantează o singură înregistrare
+  companyName String  @default("")
+  logo        String? // data URL (base64) sau URL
+  phone       String?
+  email       String?
+  address     String?
+  taxId       String? // IDNO / Tax ID
+  vatNumber   String?
+  bankDetails String? // IBAN / detalii bancare
+  currency    String  @default("MDL")
+  invoicePrefix String @default("INV")
+  // Etichetă personalizată pentru modulul de programări (afișată în meniu și header)
+  appointmentsLabel String @default("Programări")
+  // Token pentru link public de invitație Telegram (null = link dezactivat)
+  telegramInviteToken String?
+
+  // Configurare per-status pentru notificări tichete (JSON array de StatusConfig)
+  ticketStatusConfig Json?
+
+  // Ore de somn — botul nu răspunde și reminderele sunt suspendate în acest interval
+  quietHoursEnabled Boolean @default(false)
+  quietHoursStart   String  @default("22:00")
+  quietHoursEnd     String  @default("07:00")
+  quietHoursTz      String  @default("Europe/Bucharest")
+
+  // Închiderea automată a cererilor din email: după câte ore de la ultimul răspuns al operatorului, fără răspuns de la client, cererea trece în „Finalizat”.
+  emailTicketAutoCloseEnabled Boolean @default(true)
+  emailTicketAutoCloseHours   Int     @default(48)
+
+  // Neregulile de contor: pentru fiecare tip — cine remediază (client / companie), în câte zile și ce secție răspunde (JSON: { KIND: { responsible, days, teamId } }); lipsă = valorile implicite.
+  meterIssueRules Json?
+
+  // Notificările automate către clienți (contract, verificare metrologică, termen neregulă): pornit / oprit și canalele (email / SMS) — JSON { contract|metrology|issue: { enabled, email, sms } }; lipsă = pornit, email + SMS.
+  autoNotify Json?
+
+  // Mesajele automate către clienți pentru termenele neregulilor (SMS, subiect, email — pe tip și etapă), modificate din „Nereguli contoare”; lipsă = textele implicite.
+  issueMessages Json?
+
+  // --- Letterhead pentru facturile de tip „Apă-Canal" (editabil, altfel identic cu modelul primit) ---
+  // Logo dedicat (separat de logo-ul principal al firmei) — folosit doar pe facturile Apă-Canal.
+  apaCanalLogo        String?
+  apaCanalCompanyLine String @default("S.A. Apa-Canal Cahul")
+  apaCanalAddress     String @default("mun.Cahul, str.31 August 1989 nr.1")
+  apaCanalEmail       String @default("apacanalmega@gmail.com")
+  apaCanalCodFiscal   String @default("Cod fiscal 1002603000859")
+  apaCanalContactName String @default("Corneliu")
+  apaCanalContactsText String @default("0 600-99-490 · Controlor Viber/Whatsapp\n0 (299) 2-20-00 · serviciul dispecerat 24/24\n0 601-05-866 · secția evidență și control\n0 605-58-819 · secția calcul\n0 688-96-964 · secția tehnică\n0 688-96-930 · anticamera")
+  apaCanalAtentieText String @default("Vă atenționăm că în cazul neachitării acestei facturi de plată, în decurs de 10 zile de la data-limită de achitare indicată în ea, în conformitate cu legislația, operatorul este în drept să deconecteze instalațiile interne de apă și de canalizare ce aparțin, de la sistemul public de alimentare cu apă și de canalizare. Reconectarea instalațiilor interne de apă și de canalizare va fi posibilă după eliminarea cauzei care a dus la deconectare și după achitarea tarifului pentru reconectare.")
+  apaCanalAnuntText   String @default("Stimați consumatori, DVS aveți posibilitatea de a transmite indicii contorului de apă prin aplicația Viber sau WhatsApp, pe primul număr indicat mai jos, din data de 17 până pe data de 27.")
+
+  // Tarife implicite (lei/m3), pre-completate la crearea unei facturi noi Apă-Canal — pot fi modificate pe factură.
+  apaCanalTarifApa   Float @default(0)
+  apaCanalTarifCanal Float @default(0)
+
+  // Suprascrieri poziție/mărime pentru editorul vizual al facturii Apă-Canal.
+  // Formă: { [elementKey]: { xMm, yMm, widthMm, heightMm?, fontSizeMm?, bold? } }
+  apaCanalLayout Json?
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model Invoice {
+  id        String        @id @default(auto()) @map("_id") @db.ObjectId
+  number    String        @unique
+  status    InvoiceStatus @default(DRAFT)
+  kind      InvoiceKind   @default(STANDARD)
+  issueDate DateTime      @default(now())
+  dueDate   DateTime?
+  // Când a fost marcată „Plătită" în aplicație. 1C nu trimite plăți (nici stare, nici dată), deci data vine doar din marcarea manuală.
+  paidAt    DateTime?
+
+  // --- Câmpuri specifice facturii „Apă-Canal" (folosite doar când kind = APA_CANAL) ---
+  contPersonal        String?
+  sectorNr            String?
+  consumAddress       String?
+  consumerName        String?
+  meterNumber         String?
+  meterPrevReading    String?
+  meterCurrReading    String?
+  isEstimatedVolume   Boolean  @default(false)
+  billingPeriodLabel  String?
+  recalculari         Float    @default(0)
+  penalitati          Float    @default(0)
+  datoriiAvans        Float    @default(0)
+  // Istoric consum lunar pt. graficul cu bare — JSON: [{ label: "7", value: 8 }, ...]
+  monthlyConsumption  Json?
+  // Contoarele facturii când sunt mai multe (din 1C): [{ serial, prev, curr, estimated }]. Sub 2 contoare (sau gol) = se folosesc câmpurile de contor de mai sus.
+  // `metersSig` = amprenta listei, ca importul să observe schimbările fără să citească lista din toate facturile.
+  meters              Json?
+  metersSig           String?
+  // Plățile deduse din lanțul de facturi al plătitorului (lib/payment-chain.ts): cât din ACEASTĂ factură s-a achitat (cunoscut când există factura următoare), cât s-a plătit între factura anterioară și aceasta,
+  // și când s-a calculat (gol = încă neprocesată).
+  paidAmount          Float?
+  prevPaid            Float?
+  chainAt             DateTime?
+
+  // Relații opționale (nullable)
+  clientId  String? @db.ObjectId
+  client    Client? @relation(fields: [clientId], references: [id], onDelete: SetNull)
+  projectId String? @db.ObjectId
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  taskId    String? @db.ObjectId
+  task      Task?   @relation(fields: [taskId], references: [id], onDelete: SetNull)
+  taskIds   String[] @db.ObjectId
+
+  notes    String?
+  terms    String?
+  currency String  @default("MDL")
+
+  subtotal   Float @default(0)
+  taxTotal   Float @default(0)
+  grandTotal Float @default(0)
+
+  publicToken String @unique
+
+  userId String @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items InvoiceItem[]
+
+  @@index([status])
+  // Lista de facturi (mod „server", fără snapshot): filtru pe status + cele mai noi primele, fără sortare în memorie
+  @@index([status, createdAt])
+  @@index([clientId])
+  // Ultima factură pe client (snapshot-ul de plătitori): sortare după client + dată fără sortare în memorie
+  @@index([clientId, issueDate])
+  @@index([issueDate]) // listele pe luni și căutarea peste perioade (creat și la rulare de lib/services/invoice-cache.ts)
+  @@index([chainAt]) // plățile din lanțul de facturi: facturile încă neprocesate (creat și la rulare de lib/services/payment-chain.ts)
+  @@index([updatedAt]) // facturile modificate de la ultima rulare a lanțului de plăți (idem)
+  @@index([createdAt])
+}
+
+model InvoiceItem {
+  id           String  @id @default(auto()) @map("_id") @db.ObjectId
+  invoiceId    String  @db.ObjectId
+  invoice      Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description  String
+  quantity     Float   @default(1)
+  unitPrice    Float   @default(0)
+  taxRate      Float   @default(0)
+  lineSubtotal Float   @default(0)
+  lineTotal    Float   @default(0)
+  position     Int     @default(0)
+
+  @@index([invoiceId])
+}
+
+model PushSubscription {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId    String   @db.ObjectId
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Session {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId     String   @db.ObjectId
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+  userAgent  String?
+  ip         String?
+  /// Simulare de login: cine a intrat în acest cont (sesiunea expiră fix la 6 ore, fără prelungire); null = autentificare obișnuită.
+  impersonatorId String? @db.ObjectId
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model Client {
+  id                String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId            String   @db.ObjectId
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name              String
+  phone             String?
+  email             String?
+  telegramChatId    String?
+  notes             String?
+  noShowCount       Int      @default(0)
+  lastAppointmentAt DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // --- Portal client (autentificare proprie, separată de userii staff) ---
+  // "Serie contor" — identificator de login din tabelul Apă-Canal; unic per client.
+  meterSeries        String? @unique
+  // Setat abia după ce clientul finalizează înregistrarea — null = cont neactivat încă.
+  portalPasswordHash String?
+  // Pentru pagina de admin cu lista conturilor portal (cine s-a activat, cine s-a logat ultima dată).
+  portalActivatedAt  DateTime?
+  portalLastLoginAt  DateTime?
+
+  // Instantaneu al datelor de contor (din exportul Axioma) — folosit ca să generăm automat
+  // prima factură Apă-Canal exact când clientul își activează contul (vezi confirmClientRegistration).
+  meterNumber            String?
+  meterCurrReading       Float?
+  meterReadingEstimated  Boolean @default(false)
+  /// plătitorul are cel puțin un contor LoRaWAN (transmite automat); se actualizează la extragerea zilnică (lib/services/lorawan.ts)
+  meterLorawan           Boolean @default(false)
+  consumAddress          String?
+
+  /// Data expirării contractului plătitorului (introdusă manual; doar data, la 00:00 UTC): baza notificărilor „expiră în 30 / 10 zile” către plătitor și către personal.
+  contractExpiresAt DateTime?
+  /// Etapele deja notificate pentru data curentă, ex. "2026-12-31:30"; schimbarea datei le face irelevante (notificările pornesc de la capăt).
+  contractNotified  String[]
+
+  /// Cea mai apropiată scadență a verificării metrologice dintre contoarele plătitorului (denormalizat din MeterMetrology: filtre și coloană fără join); null = nicio dată introdusă.
+  metrologyDueAt DateTime?
+
+  /// Câte nereguli de contor deschise au contoarele plătitorului și cel mai apropiat termen de remediere dintre ele (denormalizat din MeterIssue: filtru și coloană în Plătitori / Notificări fără join).
+  meterIssuesOpen  Int?
+  meterIssueDueAt  DateTime?
+
+  // Instantaneu al ULTIMEI facturi (după issueDate) — MongoDB/Prisma nu poate sorta/filtra
+  // clienți după un câmp dintr-o relație (Invoice), așa că duplicăm aici ce ne trebuie pentru
+  // filtrele din /platitori (sold, status, sector), reîmprospătat la fiecare creare/modificare
+  // de factură — vezi refreshClientInvoiceSnapshot în lib/services/invoices.ts.
+  lastInvoiceStatus     InvoiceStatus?
+  lastInvoiceGrandTotal Float?
+  lastInvoiceSectorNr   String?
+  // Abonat Apă-Canal creat de importul 1C FĂRĂ cont personal (în general firme/agenți economici) — nu e
+  // client "de CRM", deci nu apare în lista /clients; facturile lui rămân în /invoices.
+  apaCanalImport        Boolean @default(false)
+  // Nr. contract din 1C (НомерДоговора) — identitatea firmelor/instituțiilor, care n-au cont personal:
+  // același contract = același plătitor, în toate lunile. (Persoanele fizice se identifică după meterSeries.)
+  apaCanalContract      String?
+  lastInvoiceIssueDate  DateTime?
+  // Ultima dată când i-am trimis o notificare (email/SMS) din /notificari-platitori — denormalizat
+  // din PayerNotificationLog ca să putem filtra/sorta plătitorii după el fără join (Mongo).
+  lastNotifiedAt        DateTime?
+
+  appointments            Appointment[]
+  projects                Project[]
+  invoices                Invoice[]
+  clientSessions          ClientSession[]
+  clientVerificationCodes ClientVerificationCode[]
+
+  @@index([userId, name])
+  @@index([userId, createdAt])
+  @@index([userId, phone])
+  @@index([userId, lastInvoiceGrandTotal])
+  @@index([userId, lastInvoiceStatus])
+  @@index([userId, lastInvoiceSectorNr])
+  @@index([lastNotifiedAt])
+  @@index([contractExpiresAt])
+  @@index([metrologyDueAt])
+  @@index([meterIssueDueAt])
+}
+
+// Jurnal al notificărilor trimise plătitorilor (email/SMS) — fără relație la Client/User intenționat
+// (ca AuditLog): istoricul rămâne chiar dacă plătitorul sau operatorul e șters. Un rând = un mesaj
+// către un destinatar pe un canal. `campaignId` grupează o trimitere în masă și face retrimiterea
+// unui lot idempotentă (nu trimitem de două ori același canal aceluiași plătitor în aceeași campanie).
+model PayerNotificationLog {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  campaignId String
+  clientId   String   @db.ObjectId
+  clientName String
+  channel    String // EMAIL | SMS
+  to         String
+  status     String // SENT | FAILED
+  error      String?
+  subject    String?
+  body       String
+  /// lipsește la notificările automate (ex. expirarea contractului)
+  userId     String?  @db.ObjectId
+  userName   String
+  createdAt  DateTime @default(now())
+
+  @@index([campaignId, clientId])
+  @@index([clientId, createdAt])
+  @@index([createdAt])
+  @@index([createdAt, channel, status]) // rezumatul ultimelor 24 h, acoperit de index (creat și la rulare de lib/queries/payer-log.ts)
+}
+
+// --- Autentificare portal client (oglindă Session/VerificationCode, dar legată de Client) ---
+
+model ClientSession {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  clientId   String   @db.ObjectId
+  client     Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  tokenHash  String   @unique
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  lastUsedAt DateTime @default(now())
+  userAgent  String?
+  ip         String?
+  /// Simulare de login în portal: utilizatorul (staff) care a intrat în contul clientului (expiră fix la 6 ore); null = client real.
+  impersonatedById String? @db.ObjectId
+
+  @@index([clientId])
+  @@index([expiresAt])
+}
+
+model ClientVerificationCode {
+  id        String    @id @default(auto()) @map("_id") @db.ObjectId
+  clientId  String    @db.ObjectId
+  client    Client    @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  purpose   String // REGISTRATION | PASSWORD_RESET
+  codeHash  String
+  expiresAt DateTime
+  usedAt    DateTime?
+  attempts  Int?      // încercări greșite — blocat după MAX_ATTEMPTS (vezi lib/services/client-verification-codes.ts)
+  createdAt DateTime  @default(now())
+
+  @@index([clientId, purpose, createdAt])
+}
+
+model Category {
+  id                     String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId                 String   @db.ObjectId
+  user                   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name                   String
+  color                  String   @default("#6366f1")
+  defaultDurationMinutes Int      @default(30)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
+
+  appointments Appointment[]
+  tasks        Task[]
+
+  @@index([userId, name])
+}
+
+model Appointment {
+  id        String  @id @default(auto()) @map("_id") @db.ObjectId
+  // Cel care a creat programarea (secretara)
+  userId    String  @db.ObjectId
+  user      User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  // Opțional: cel pentru care e programarea (directorul) — o vede și el, e notificat el și cel care a creat-o
+  assigneeId String? @db.ObjectId
+  assignee   User?   @relation("AppointmentAssignee", fields: [assigneeId], references: [id], onDelete: SetNull)
+  clientId  String  @db.ObjectId
+  client    Client  @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  categoryId String? @db.ObjectId
+  category  Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  title   String
+  message String?
+  status  AppointmentStatus @default(NEW)
+
+  startAt DateTime
+  endAt   DateTime
+  // dateKey: "YYYY-MM-DD" (în fusul orar al userului) pentru query-uri zilnice ultra-rapide
+  dateKey String
+
+  // Snapshot-uri denormalizate — Telegram/listări afișează fără include/join
+  clientNameSnapshot   String
+  categoryNameSnapshot String?
+  categoryColorSnapshot String?
+  // Culoarea rândului în listă (hex „#rrggbb”), aleasă de utilizator; gol = fără culoare.
+  color String?
+
+  reminderEmailEnabled    Boolean @default(false)
+  reminderTelegramEnabled Boolean @default(false)
+  // Praguri selectate pt. această programare: ex. ["DAY_BEFORE_8AM","H3"] — vezi lib/reminder-presets.ts
+  reminderOffsets         String[] @default(["DAY_BEFORE_8AM", "H3"])
+  // Remindere ca la sarcini (vezi lib/reminder-schedule.ts): „înainte de începere” (mai multe praguri), zilnic / săptămânal / lunar / la interval, sau interval fix; se opresc la începerea programării.
+  // Cu programare / interval setat, reminderele vechi (Reminder, praguri fixe) nu se mai folosesc pentru această programare.
+  reminderSchedule        Json?
+  reminderIntervalMinutes Int?
+  nextReminderAt          DateTime?
+
+  // Locația programării (opțional): adresa scrisă, coordonatele (GPS / dintr-un link de hartă) și linkul Google Maps lipit; se deschid în Google Maps / Apple Maps / Waze
+  address String?
+  lat     Float?
+  lng     Float?
+  mapUrl  String?
+
+  createdFrom CreatedFrom @default(WEB)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  reminders Reminder[]
+
+  @@index([userId, dateKey])
+  @@index([userId, startAt])
+  @@index([userId, status])
+  @@index([userId, clientId])
+  @@index([clientId])
+  @@index([nextReminderAt])
+  @@index([assigneeId, dateKey])
+  @@index([startAt]) // calendarul pentru toți utilizatorii (creat și la rulare de lib/queries/appointments.ts)
+}
+
+model Reminder {
+  id            String         @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String         @db.ObjectId
+  user          User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  appointmentId String         @db.ObjectId
+  appointment   Appointment    @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  type          ReminderType
+  sendAt        DateTime
+  status        ReminderStatus @default(PENDING)
+  attempts      Int            @default(0)
+  lastError     String?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  @@index([status, sendAt])
+  @@index([appointmentId])
+  @@index([userId])
+}
+
+// userId nul = contact Telegram „pending": a apăsat /start dar niciun admin
+// nu i-a creat încă profilul în CRM (lucrătorul nu are și nu are nevoie de cont CRM).
+// Notă: userId NU e @unique — pe MongoDB un index unic pe un câmp opțional ar respinge
+// al doilea contact „pending" (toate documentele fără userId sunt tratate ca null duplicat).
+// Unicitatea per-user e garantată la nivel de aplicație (approveTelegramContact).
+model TelegramAccount {
+  id             String   @id @default(auto()) @map("_id") @db.ObjectId
+  userId         String?  @db.ObjectId
+  user           User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  telegramUserId String   @unique
+  chatId         String
+  username       String?
+  firstName      String?
+  lastName       String?
+  // ce view e activ în bot, pentru context la callback-uri (ex. „awaiting_comment:<taskId>")
+  lastMenuState  String?
+  linkedAt       DateTime @default(now())
+
+  // telegramUserId e deja indexat prin @unique
+  @@index([chatId])
+  @@index([userId])
+}
+
+model NotificationLog {
+  id            String              @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String              @db.ObjectId
+  user          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel       NotificationChannel
+  target        String?
+  appointmentId String?             @db.ObjectId
+  reminderId    String?             @db.ObjectId
+  success       Boolean
+  error         String?
+  createdAt     DateTime            @default(now())
+
+  @@index([userId, createdAt])
+}
+
+/// Jurnalul TUTUROR trimiterilor (email, SMS, Telegram, push, notificări în aplicație): ce s-a trimis, cui, de cine, cu ce rezultat. Se scrie la nivelul cel mai de jos al
+/// trimiterii (vezi lib/delivery-log.ts), deci prinde orice trimitere, indiferent de unde pornește. Se șterge singur (cron zilnic): 30 de zile, iar INAPP / PUSH 14 zile.
+model DeliveryLog {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  /// EMAIL | SMS | TELEGRAM | PUSH | INAPP
+  channel    String
+  /// SENT | FAILED | SKIPPED (omis: canal neconfigurat, destinatar fără adresă / abonament…)
+  status     String
+  /// tipul trimiterii (ex. task.reminder, invoice.email, payer.campaign, verification.code, ticket.message); gol = nespecificat
+  kind       String?
+  /// ce a pornit trimiterea: web (acțiune a unui utilizator) | cron:<nume> | timer | bot | system
+  source     String
+  toUserId   String?  @db.ObjectId
+  toClientId String?  @db.ObjectId
+  toName     String?
+  /// adresa efectivă: email, telefon, chat id Telegram, „N dispozitive” (push)
+  to         String?
+  fromUserId String?  @db.ObjectId
+  fromName   String?
+  /// adresa / numele de expeditor folosit (From)
+  fromAddr   String?
+  subject    String?
+  body       String?
+  bodyHtml   String?
+  objectType String?
+  objectId   String?
+  objectName String?
+  campaignId String?
+  error      String?
+  /// id-ul dat de furnizor (Message-ID SMTP, message_id Telegram, răspunsul gateway-ului SMS)
+  providerId String?
+  durationMs Int?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([channel, createdAt])
+  @@index([status, createdAt])
+  @@index([kind, createdAt])
+  @@index([toUserId, createdAt])
+  @@index([toClientId, createdAt])
+  @@index([objectId, createdAt])
+  @@index([campaignId])
+  @@index([createdAt, channel, status, kind]) // rezumatul ultimelor 24 h, acoperit de index (creat și la rulare de lib/queries/delivery.ts)
+}
+
+model VoiceCommandLog {
+  id            String      @id @default(auto()) @map("_id") @db.ObjectId
+  userId        String      @db.ObjectId
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  source        VoiceSource @default(WEB)
+  transcript    String
+  parsedJson    Json?
+  status        VoiceStatus @default(TRANSCRIBED)
+  appointmentId String?     @db.ObjectId
+  createdAt     DateTime    @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model AppSettings {
+  id     String @id @default(auto()) @map("_id") @db.ObjectId
+  userId String @unique @db.ObjectId
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  timezone String @default("Europe/Bucharest")
+  locale   String @default("ro")
+  theme    String @default("system") // system | light | dark
+
+  // Program de lucru (folosit la calendar + verificare slot ocupat)
+  workdayStart String @default("09:00")
+  workdayEnd   String @default("18:00")
+  slotMinutes  Int    @default(30)
+
+  // Default-uri pentru programări noi
+  defaultReminderEmail    Boolean  @default(false)
+  defaultReminderTelegram Boolean  @default(true)
+  // "Standardul" — presetările bifate implicit la o programare nouă (ajustabile per programare)
+  reminderOffsets         String[] @default(["DAY_BEFORE_8AM", "H3"])
+
+  // Email (override peste env, opțional)
+  emailFromName  String?
+  emailFromAddr  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// --- Tabelul 1C: avizele de plată din 1C (un rând per abonat și lună), cu TOATE datele din răspuns — pentru verificarea
+// de către cei de la 1C. Coloanele: vezi lib/apa-canal-1c.ts (ONEC_COLUMNS). `uid` = „<cod abonat fără spații>|AAAA-LL”.
+// Înregistrările vechi (export cu 6 tabele legate prin UID) au un UID 1C și rămân neatinse; contoarele / citirile / liniile
+// (JSON) se reconstruiesc din aviz în forma pe care o așteaptă paginile de contoare.
+model OneCRecord {
+  id            String   @id @default(auto()) @map("_id") @db.ObjectId
+  uid           String   @unique
+  numeOriginal  String?
+  invoiceNumber String?
+  clientId      String?  @db.ObjectId
+  nume            String?
+  nrContract      String?
+  contPersonal    String?
+  tipSector       String?
+  telefon         String?
+  oras            String?
+  strada          String?
+  casa            String?
+  apartament      String?
+  dataDoc         String?
+  calculat        Float?
+  datorieAvans    Float?
+  deAchitat       Float?
+  consumatori     String?
+  nrConsumatori   Float?
+  inn             String?
+  zonaPresiune    String?
+  sectorUchastok  String?
+  nrPersoane      Float?
+  suprafata       Float?
+  inceputConsum   String?
+  sfarsitConsum   String?
+  nrContoare      Float?
+  contorActiv     String?
+  dataInstalare   String?
+  sigiliu         String?
+  dataScoatere    String?
+  citirePrec      Float?
+  dataCitirePrec  String?
+  citireCurenta   Float?
+  dataCitire      String?
+  consumTotal     Float?
+  sursaCitire     String?
+  apaVolum        Float?
+  apaTarif        Float?
+  apaSuma         Float?
+  canalVolum      Float?
+  canalTarif      Float?
+  canalSuma       Float?
+  // Noul 1C (avize de plată, `…/infoCec/info/apl/<dată>`): soldurile lunii, plățile reale și serviciile suplimentare.
+  // Câmpurile de mai sus care nu mai vin din noul 1C (telefon, IDNO, sector, consumatori…) rămân doar pe înregistrările vechi.
+  lunaViitoare    String?
+  soldInit        Float?
+  platit          Float?
+  recalc          Float?
+  gunoiSuma       Float?
+  toSuma          Float?
+  toTarif         Float?
+  apartamentSuma  Float?
+  // Defalcarea pe servicii (sold inițial, plătit, recalcul, spre plată) — toate câmpurile avizului 1C apar în Tabelul 1C
+  apaSoldInit    Float?
+  apaPlatit      Float?
+  apaRecalc      Float?
+  apaSprePlata   Float?
+  canalSoldInit    Float?
+  canalPlatit      Float?
+  canalRecalc      Float?
+  canalSprePlata   Float?
+  gunoiSoldInit    Float?
+  gunoiPlatit      Float?
+  gunoiRecalc      Float?
+  gunoiSprePlata   Float?
+  toSoldInit    Float?
+  toPlatit      Float?
+  toRecalc      Float?
+  toSprePlata   Float?
+  apartamentSoldInit    Float?
+  apartamentPlatit      Float?
+  apartamentRecalc      Float?
+  apartamentSprePlata   Float?
+  /// avizul 1C exact cum a fost primit (toate cele 45 de câmpuri)
+  raw             Json?
+  consumers     Json?
+  meters        Json?
+  readings      Json?
+  lines         Json?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([contPersonal])
+  @@index([nume])
+  @@index([invoiceNumber])
+  @@index([clientId])
+}
+
+// --- Integrare API: linkul + credențialele cu care se extrag datele (ex: plătitorii Apă-Canal din exportul
+// 1C expus ca API). Un singur document per `key`. Parola/token-ul sunt criptate (lib/secret-box.ts) și nu
+// ajung niciodată în browser.
+model ApiIntegration {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  key             String
+  url             String?
+  username        String?
+  passwordEnc     String?
+  tokenEnc        String?
+  lastSyncAt      DateTime?
+  lastSyncOk      Boolean?
+  lastSyncMessage String?
+  // Blocare cât rulează o sincronizare (două rulări simultane ar crea clienți dubli).
+  syncLockUntil   DateTime?
+  // Sincronizare automată (cron zilnic: /api/cron/apa-canal-sync). Se poate porni doar după o
+  // sincronizare reușită cu setările curente și se oprește singură dacă se schimbă linkul/credențialele.
+  autoSyncEnabled Boolean?
+  // Amprenta ultimului răspuns scris: dacă API-ul întoarce exact același lucru, cron-ul nu mai face nimic.
+  lastContentHash String?
+  lastSuccessAt   DateTime?
+  updatedById     String?   @db.ObjectId
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([key])
+}
+
+// Șabloane de mesaj pentru notificările către plătitori (/notificari-platitori) — comune pentru toți operatorii.
+// Textele pot conține variabile {nume}, {suma}, {factura}, {cont}, {scadenta}, {adresa}.
+model PayerNotifyTemplate {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  name      String
+  subject   String   @default("")
+  email     String   @default("")
+  sms       String   @default("")
+  // Mesajul vorbit al notificării prin apel + vocea (vezi NOTIFY_VOICES în lib/payer-notify.ts).
+  call      String?
+  voice     String?
+  createdBy String   @db.ObjectId
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([createdAt])
+}
+
+// Șabloane de task-uri / tichete: titlu (cu variabile {contor}, {data}, {luna}, {an}), descriere, categorie, proiect, client, responsabili…
+// Fără relații (id-urile se verifică la folosire): ștergerea unei categorii/proiect nu strică șablonul. `counter` = următorul număr pentru {contor}.
+model TaskTemplate {
+  id          String       @id @default(auto()) @map("_id") @db.ObjectId
+  type        TaskType     @default(TASK)
+  name        String
+  title       String
+  description String?
+  priority    TaskPriority @default(MEDIUM)
+  categoryId  String?      @db.ObjectId
+  projectId   String?      @db.ObjectId
+  clientId    String?      @db.ObjectId
+  address     String?
+  assigneeIds String[]     @db.ObjectId
+  teamIds     String[]     @db.ObjectId
+  /** Termen = azi + atâtea zile (null = fără termen). */
+  dueDays     Int?
+  reminderIntervalMinutes Int?
+  /// Reamintire programată (JSON din lib/reminder-schedule.ts: zilnic / săptămânal / lunar / la interval); când e setată, reminderIntervalMinutes e null. Fără dată fixă: „o singură dată” nu se salvează în șabloane.
+  reminderSchedule Json?
+  counter     Int          @default(1)
+  createdById String       @db.ObjectId
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  @@index([type, name])
+}
+
+// Șabloane de cereri pentru clienți (cabinetul personal / portal): create de administrator, alese de client dintr-o listă la crearea unei cereri.
+// Titlul și descrierea completează formularul; clientul le poate modifica înainte de trimitere.
+model PortalRequestTemplate {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  name        String
+  title       String
+  description String   @default("")
+  /// Secția (echipa) care se ocupă de acest tip de cerere: tichetul i se atribuie și doar membrii ei sunt notificați; gol = administratorii
+  teamId      String?  @db.ObjectId
+  /// Termenul prestabilit de rezolvare, în zile calendaristice de la depunere: devine scadența cererii create din acest șablon; gol = fără termen
+  dueDays     Int?
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([sortOrder, name])
+}
+
+// Coada de apeluri de notificare către plătitori (canalul „Apel" din /notificari-platitori): un rând per plătitor de sunat.
+// Trimiterea creează rândurile „queued"; din /pbx (fila „Notificări apel") operatorul apasă „Sună" → makecall la PBX Moldcell
+// (sună întâi operatorul, apoi îl leagă cu plătitorul) și `callId` leagă rândul de apelul din PbxCall (stare, durată, înregistrare).
+model NotifyCall {
+  id         String    @id @default(auto()) @map("_id") @db.ObjectId
+  campaignId String
+  clientId   String    @db.ObjectId
+  clientName String
+  phone      String
+  text       String // mesajul de transmis (șablonul cu datele plătitorului)
+  status     String // queued | dialing
+  callId     String?
+  operator   String?
+  dialedAt   DateTime?
+  // Încercări automate de sunat din /api/cron/notify-calls (max 3, apoi rămâne în coadă pentru apel manual).
+  tries      Int?
+  note       String?
+  userId     String    @db.ObjectId
+  userName   String
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  @@index([createdAt])
+  @@index([updatedAt]) // diferența pentru /pbx (creat și la rulare de lib/services/pbx-data.ts)
+  @@index([clientId, createdAt])
+  @@index([campaignId])
+  @@index([callId])
+}
+
+// Notițe interne pe un plătitor (cine a scris, când) — mai multe pe plătitor, ca un jurnal. Fără relație la
+// Client/User intenționat (ca AuditLog): se șterg explicit odată cu plătitorul (vezi deletePayer).
+model PayerNote {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  clientId  String   @db.ObjectId
+  body      String
+  userId    String   @db.ObjectId
+  userName  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId, createdAt])
+}
+
+// ── PBX (Moldcell) — apeluri primite prin webhook (/api/pbx) ──
+// Pentru un apel vin MAI MULTE mesaje (același callid): fiecare se păstrează brut în PbxEvent, iar PbxCall e
+// rezumatul apelului (un rând per callid), actualizat la fiecare mesaj nou.
+model PbxCall {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  callId      String    @unique
+  direction   String? // in | out
+  phone       String? // numărul celuilalt interlocutor, așa cum a venit (ex. 37378608080)
+  phoneE164   String? // +37378608080
+  diversion   String? // numărul companiei format de apelant (telnum/diversion)
+  pbxUser     String? // câmpul "user" din mesaj (operatorul care a răspuns)
+  ext         String? // extensia internă (ex. 703)
+  status      String? // rezultatul final din mesajul "history": success | missed | ...
+  state       String? // ultima stare din mesajele "event": INCOMING | ACCEPTED | COMPLETED
+  durationSec Int?
+  waitSec     Int? // cât a așteptat apelantul până la răspuns
+  recordingUrl String? // link către înregistrare (din "history")
+  rating      Int? // nota dată de client (mesajul "rating")
+  groupName   String? // departamentul prin care a trecut apelul (groupRealName)
+  lineName    String? // numele numărului companiei (telnum_name)
+  transferredTo String? // second_callid, la evenimentul TRANSFERRED
+  note        String? // notă despre apel, scrisă de operator (cine a sunat, ce a cerut)
+  startAt     DateTime?
+  lastCmd     String?
+  eventCount  Int       @default(0)
+  // potrivire cu un client după telefon (la primirea apelului)
+  clientId    String?   @db.ObjectId
+  clientName  String?
+  firstSeenAt DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([startAt])
+  @@index([phoneE164])
+  @@index([updatedAt])
+}
+
+model PbxEvent {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  callId     String
+  cmd        String?
+  payload    Json
+  receivedAt DateTime @default(now())
+
+  @@index([callId, receivedAt])
+  @@index([receivedAt])
+}
+
+/// Cache durabil, partajat între toate instanțele serverului, pentru lista de plătitori (/platitori): un singur rând
+/// (id fix "snapshot") cu toți plătitorii ca JSON comprimat. Se reconstruiește o dată pe zi (cron) și când se modifică datele
+/// (dirtyAt > builtAt) — vezi lib/services/payer-cache.ts. Fără id ObjectId ca să nu fie nevoie de upsert/index unic.
+model PayerCacheEntry {
+  id       String    @id @map("_id")
+  /// se schimbă la fiecare reconstruire; folosit ca ETag
+  version  String
+  builtAt  DateTime
+  /// ultima modificare a datelor care intră în snapshot; > builtAt = snapshot depășit (cititorii așteaptă reconstruirea)
+  dirtyAt  DateTime?
+  /// modificări minore (ex. „ultima notificare"): se reconstruiește în fundal, iar cititorii primesc varianta existentă
+  softDirtyAt DateTime?
+  rows     Int
+  /// {"v":2,"at":ms,"sorted":true,"rows":[tupluri],"months":[...]} comprimat gzip
+  gz       Bytes
+}
+
+// Citiri lunare din teren: persoana responsabilă merge la fiecare contor, scrie indexul (m³) pe luna curentă; se păstrează locația (GPS) de la
+// momentul citirii și, opțional, o poză cu contorul. O citire pe contor și lună (se poate corecta în aceeași lună). Fără relații: istoricul rămâne
+// chiar dacă utilizatorul sau abonatul sunt șterși (numele operatorului e copiat aici). `meterId` = id-ul stabil din lista de contoare
+// (vezi lib/queries/meters.ts: „<cheie abonat>~<nr. contor>~<k>” sau „a:<idClient>”).
+/// Locația și adresa unui contor, completate din teren (1C nu trimite adresa multor abonați, mai ales firme): adresa se scrie o dată la prima citire, iar locația GPS
+/// se ia de la telefon. O înregistrare pe contor; datele din 1C câștigă mereu (adresa de aici se folosește doar cât timp 1C n-are una).
+model MeterLocation {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  meterId   String   @unique
+  contor    String
+  address   String?
+  lat       Float?
+  lng       Float?
+  /// precizia locației, în metri
+  accuracy  Float?
+  userId    String?  @db.ObjectId
+  userName  String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Verificarea metrologică a unui contor (data o introduce personalul, manual): următoarea scadență = data + 5 ani (vezi lib/metrology.ts). Fără relații, ca MeterLocation:
+/// `meterId` e id-ul stabil din lista de contoare. `notified` = etapele deja anunțate pentru scadența curentă (ex. "2031-05-01:60"); o dată nouă le resetează.
+model MeterMetrology {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  meterId    String   @unique
+  contor     String
+  clientId   String?  @db.ObjectId
+  /// data ultimei verificări metrologice (00:00 UTC)
+  verifiedAt DateTime
+  notified   String[]
+  userId     String?  @db.ObjectId
+  userName   String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([verifiedAt])
+}
+
+model MeterReading {
+  id           String   @id @default(auto()) @map("_id") @db.ObjectId
+  meterId      String
+  contor       String
+  clientId     String?  @db.ObjectId
+  /// luna citirii, „YYYY-MM” (fusul orar al firmei)
+  period       String
+  /// indexul contorului, în m³
+  value        Float
+  /// indexul anterior cunoscut în momentul citirii (1C sau o citire din teren mai veche) — pentru consum
+  prevValue    Float?
+  readAt       DateTime
+  lat          Float?
+  lng          Float?
+  /// precizia locației, în metri
+  accuracy     Float?
+  /// distanța față de locația ultimei citiri a aceluiași contor, în metri (semnal de verificare)
+  distanceM    Float?
+  photoUrl     String?
+  photoName    String?
+  note         String?
+  /// cine a făcut citirea: un utilizator (cititor din teren) sau, la citirile din portal, lipsă (vezi `source`)
+  userId       String?  @db.ObjectId
+  userName     String
+  /// „PORTAL” = trimisă de plătitor din portal (userName = numele plătitorului); lipsă = citire din teren
+  source       String?
+  /// consumul mediu lunar al contorului (m³) în momentul citirii — baza verificării „peste / sub medie”; lipsă = istoric insuficient
+  avgConsum    Float?
+  /// plătitorul a confirmat citirea din emailul de verificare (se șterge la orice schimbare a indexului)
+  verifiedAt   DateTime?
+  /// plătitorul a contestat citirea din emailul de verificare („nu e corectă / nu eu am trimis-o”); personalul e anunțat
+  disputedAt   DateTime?
+  disputeNote  String?
+  /// trimisă către 1C (vezi lib/services/onec-readings.ts): momentul și indexul trimis. Dacă indexul se corectează după trimitere, citirea apare din nou „de trimis”.
+  sent1cAt     DateTime?
+  sent1cValue  Float?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([meterId, period])
+  @@index([period, readAt])
+  @@index([meterId, readAt])
+  @@index([userId, period])
+}
+
+/// Jurnalul trimiterilor de citiri către 1C (o înregistrare per apăsare a butonului „Trimite către 1C” sau per rundă): ce s-a găsit, ce s-a trimis, ce a confirmat 1C.
+model OneCSendLog {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  at        DateTime @default(now())
+  userId    String?  @db.ObjectId
+  userName  String
+  /// citiri găsite „de trimis” / documente formate / documente trimise și confirmate / documente neconfirmate sau respinse
+  readings  Int
+  documents Int
+  sent      Int
+  failed    Int
+  /// suma lungimilor întoarse de 1C (trebuie să fie egală cu numărul de documente trimise)
+  confirmed Int
+  /// JSON: pe surse, pe loturi, motive de eșec
+  details   String?
+
+  @@index([at])
+}
+
+/// Rută de citire: ce contoare (după datele din 1C: sector / localitate / stradă) citește un cititor și în ce zile ale lunii.
+/// Un contor aparține primei rute (după ordine) ale cărei reguli i se potrivesc.
+model ReadingRoute {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  name       String
+  /// valorile „Участок” (sector) din 1C
+  sectors    String[]
+  localities String[]
+  /// fragmente de adresă (stradă), fără diacritice / majuscule
+  streets    String[]
+  readerId   String?  @db.ObjectId
+  /// fereastra din lună în care se citește (zilele lunii)
+  startDay   Int      @default(1)
+  endDay     Int      @default(28)
+  order      Int      @default(0)
+  active     Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([readerId])
+}
+
+/// Starea contorului / neregula găsită în teren (defect, fraudă, curgere inversă etc.). Poate fi legată de o citire sau raportată singură (contor inaccesibil).
+model MeterIssue {
+  id           String    @id @default(auto()) @map("_id") @db.ObjectId
+  meterId      String
+  contor       String
+  /// DEFECT, REVERSE, FRAUD, SEAL, LEAK, UNREADABLE, INACCESSIBLE, OTHER (vezi lib/meter-issues.ts)
+  kind         String
+  note         String?
+  /// luna raportării, „YYYY-MM”
+  period       String
+  readingId    String?   @db.ObjectId
+  /// momentul real al constatării (la citirile offline, ora de pe telefon)
+  reportedAt   DateTime
+  userId       String?   @db.ObjectId
+  userName     String
+  /// „PORTAL” = raportată de plătitor din portal
+  source       String?
+  createdAt    DateTime  @default(now())
+  resolvedAt   DateTime?
+  resolvedById String?   @db.ObjectId
+  resolvedName String?
+  resolvedNote String?
+
+  /// Cine trebuie să remedieze: CLIENT sau COMPANY (lipsă = de stabilit de personal); secția responsabilă (echipa) și termenul de remediere (doar data, 00:00 UTC).
+  responsible String?
+  teamId      String?   @db.ObjectId
+  dueAt       DateTime?
+  /// etapele deja anunțate pentru termenul curent, ex. "2026-11-10:3" (cu 3 zile înainte) și "2026-11-10:0" (termen depășit); un termen nou le resetează
+  dueNotified String[]
+
+  @@index([dueAt])
+  @@index([meterId, reportedAt])
+  @@index([resolvedAt, reportedAt])
+  @@index([period])
+  @@index([userId, period])
+}
+
+/// Șablon de rol / tip de utilizator: completează formularul de utilizator (rol, permisiuni, ce sarcini vede). `key` = cheia unui tip implicit (reader, operator, supervisor, viewer —
+/// atunci rândul e o MODIFICARE a tipului implicit; ștergerea lui readuce originalul) sau un id generat pentru un șablon creat de administrator.
+model RoleTemplate {
+  id          String   @id @default(auto()) @map("_id") @db.ObjectId
+  key         String   @unique
+  name        String
+  description String?
+  /// ADMIN (acces la tot) sau STAFF (cu permisiunile de mai jos)
+  role        String   @default("STAFF")
+  permissions String[]
+  /// "ALL" / "OWN" / null = nu schimbă ce sarcini vede
+  taskView    String?
+  createdById String?  @db.ObjectId
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+/// Contoare din CRM care transmit automat prin LoRaWAN (extragere zilnică la 23:00 din serverul de noduri). Cheia = id-ul contorului din CRM (vezi lib/queries/meters.ts).
+/// Un contor intră aici la prima potrivire cu numărul primit (fără prefixul „S”), chiar dacă ultima transmisie e dintr-o lună mai veche (atunci citirea se ignoră, dar sursa rămâne LoRaWAN
+/// și contorul rămâne needitabil manual).
+model LorawanMeter {
+  id        String   @id @map("_id")
+  /// numărul contorului ca în CRM
+  contor    String
+  clientId  String?  @db.ObjectId
+  /// ultimul volum primit (m³) și momentul transmisiei
+  volume    Float
+  ts        DateTime
+  /// luna ultimei citiri salvate din acest contor („YYYY-MM”); lipsă = nicio citire salvată
+  period    String?
+  /// la ultima extragere: matched (transmisie din luna curentă) | stale (transmisie din altă lună: ignorată)
+  status    String
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@index([contor])
+}
+
+/// Starea extragerii LoRaWAN (un singur rând, id „main”).
+model LorawanState {
+  id          String    @id @map("_id")
+  /// ziua (în fusul firmei, „YYYY-MM-DD”) pentru care extragerea automată s-a terminat cu succes
+  lastRunDay  String    @default("")
+  lastRunAt   DateTime?
+  lastOk      Boolean   @default(true)
+  lastTrigger String    @default("")
+  message     String    @default("")
+  durationMs  Int       @default(0)
+  /// contoare numărate la ultima extragere (primite, potrivite, citiri salvate, ignorate…)
+  stats       Json?
+  /// primele nume de contoare primite care nu există în CRM
+  unmatched   Json?
+  /// momentul activării: până atunci extragerea automată (23:30 / cron) nu pornește; prima extragere o face administratorul din pagina LoRaWAN („Activează”)
+  activatedAt DateTime?
+  /// o extragere cu eșec se reia după acest moment
+  retryAt     DateTime  @default("1970-01-01T00:00:00.000Z")
+  /// blocaj între instanțe: nimeni nu pornește o extragere cât e în viitor
+  lockUntil   DateTime  @default("1970-01-01T00:00:00.000Z")
+}
+
+/// Bifele paginii „Caiet de sarcini” (lib/tender-spec.ts): un rând = un punct bifat de echipă. Cheia = id-ul punctului; bifa scoasă șterge rândul.
+model TenderCheck {
+  id        String   @id @map("_id")
+  byId      String?  @db.ObjectId
+  byName    String   @default("")
+  updatedAt DateTime @updatedAt
+}
+
+/// Citire trimisă de plătitor din portal, în așteptarea confirmării din email. Nu e încă o citire: devine MeterReading (sursa „PORTAL”, verificată)
+/// abia când plătitorul apasă „Confirm” în emailul primit; până atunci nu apare nicăieri ca citit. Una per (plătitor, contor): o trimitere nouă o înlocuiește.
+model PortalReadingPending {
+  id         String   @id @default(auto()) @map("_id") @db.ObjectId
+  clientId   String   @db.ObjectId
+  meterId    String
+  contor     String
+  /// luna citirii, „YYYY-MM” (fusul orar al firmei), calculată la trimitere
+  period     String
+  value      Float
+  /// plătitorul a confirmat deja avertismentul „index mai mic / consum neobișnuit de mare”
+  confirmed  Boolean  @default(false)
+  issueKind  String?
+  issueNote  String?
+  /// poza contorului (obligatorie), deja pe disc / în Blob; se leagă de citire la confirmare
+  photoUrl   String
+  photoName  String?
+  lat        Float?
+  lng        Float?
+  accuracy   Float?
+  submittedAt DateTime @default(now())
+  expiresAt  DateTime
+  /// de câte ori s-a trimis emailul de confirmare (limită la retrimitere)
+  emailsSent Int      @default(1)
+
+  @@unique([clientId, meterId])
+  @@index([expiresAt])
+}
+
+/// Notificări către plătitori / clienți programate (o singură dată, zilnic, săptămânal, lunar sau la interval): rulează singure (cron / procesul serverului), apar în jurnalul de notificări.
+model NotifySchedule {
+  id            String    @id @default(auto()) @map("_id") @db.ObjectId
+  name          String
+  /// "payers" | "clients"
+  audience      String
+  /// plătitori: filtrele din pagina Notificări (JSON, vezi NotifyFilters) — destinatarii se recalculează la fiecare rulare; clienți: { q, contact }
+  filters       Json?
+  /// selecție fixă de id-uri (când nu s-au folosit filtre)
+  ids           String[]
+  /// mesajul: { email: {enabled, subject, body}, sms: {enabled, body, ascii}, call: {enabled, body, voice} }
+  message       Json
+  /// programul (vezi lib/reminder-schedule.ts: ReminderSchedule)
+  schedule      Json
+  active        Boolean   @default(true)
+  nextRunAt     DateTime?
+  lastRunAt     DateTime?
+  lastResult    String?
+  runCount      Int       @default(0)
+  createdById   String    @db.ObjectId
+  createdByName String
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([active, nextRunAt])
+}

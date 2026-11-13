@@ -1,0 +1,164 @@
+import * as XLSX from "xlsx";
+import { isValidDateKey } from "./date";
+
+export type ParsedRow = Record<string, string>;
+
+/**
+ * Parsează un fișier Excel sau CSV și returnează rândurile ca obiecte.
+ * Prima linie devine cheile obiectului (antet). Valorile sunt întotdeauna string.
+ */
+export function parseWorkbook(buffer: ArrayBuffer): ParsedRow[] {
+  // raw: true → CSV-ul se citește ca text (altfel „01.12.2026” devine o dată americană „1/12/26”, iar „069…” pierde zeroul din față).
+  const wb = XLSX.read(buffer, { type: "array", cellText: true, cellDates: false, codepage: 65001, raw: true });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  if (!ws) return [];
+
+  const raw = XLSX.utils.sheet_to_json<Record<string, unknown>>(ws, {
+    defval: "",
+    raw: false,
+  });
+
+  return raw.map((row) => {
+    const cleaned: ParsedRow = {};
+    for (const [k, v] of Object.entries(row)) {
+      // Strip BOM ﻿ that SheetJS includes in the first column when parsing BOM-prefixed CSV
+      const key = String(k).replace(/^﻿/, "").trim();
+      cleaned[key] = String(v ?? "").trim();
+    }
+    return cleaned;
+  });
+}
+
+/**
+ * Dacă fișierul e JSON (listă de obiecte, sau { items | data: [...] }), îl întoarce ca rânduri
+ * de string-uri — aceeași formă ca parseWorkbook, deci restul importului nu vede diferența.
+ * Întoarce null dacă nu arată a JSON (atunci se încearcă Excel/CSV). Aruncă dacă e JSON invalid.
+ */
+export function parseJsonRows(buffer: ArrayBuffer): ParsedRow[] | null {
+  const text = new TextDecoder("utf-8").decode(buffer).replace(/^﻿/, "").trim();
+  if (!text.startsWith("[") && !text.startsWith("{")) return null;
+
+  const data = JSON.parse(text);
+  const list = Array.isArray(data) ? data : Array.isArray(data?.items) ? data.items : Array.isArray(data?.data) ? data.data : null;
+  if (!list) throw new Error("JSON-ul trebuie să fie o listă de obiecte.");
+
+  return list
+    .filter((o: unknown): o is Record<string, unknown> => !!o && typeof o === "object" && !Array.isArray(o))
+    .map((o: Record<string, unknown>) => {
+      const row: ParsedRow = {};
+      for (const [k, v] of Object.entries(o)) row[k.trim()] = v == null ? "" : String(v).trim();
+      return row;
+    });
+}
+
+// ─── Reverse-maps: Romanian label → DB enum ────────────────────────────────
+
+export const RO_TO_TASK_STATUS: Record<string, string> = {
+  "Nou": "NEW",
+  "Asignat": "ASSIGNED",
+  "Citit": "READ",
+  "În lucru": "IN_PROGRESS",
+  "In lucru": "IN_PROGRESS",
+  "În așteptare": "ON_HOLD",
+  "In asteptare": "ON_HOLD",
+  "Review": "REVIEW",
+  // etichetele din aplicație (și din Telegram) pentru același status
+  "Verificare": "REVIEW",
+  "În verificare": "REVIEW",
+  "La verificare": "REVIEW",
+  "Finalizat": "DONE",
+  "Anulat": "CANCELLED",
+};
+
+export const RO_TO_TASK_PRIORITY: Record<string, string> = {
+  "Scăzută": "LOW",
+  "Scazuta": "LOW",
+  "Scăzut": "LOW",
+  "Medie": "MEDIUM",
+  "Ridicată": "HIGH",
+  "Ridicata": "HIGH",
+  "Urgentă": "URGENT",
+  "Urgenta": "URGENT",
+  "Urgent": "URGENT", // eticheta din aplicație
+};
+
+export const RO_TO_TASK_TYPE: Record<string, string> = {
+  "Sarcină": "TASK",
+  "Cerere": "TICKET",
+  // denumirile vechi rămân acceptate (fișiere exportate înainte de schimbarea terminologiei)
+  "Task": "TASK",
+  "Tichet": "TICKET",
+};
+
+export const RO_TO_PROJECT_STATUS: Record<string, string> = {
+  "Activ": "ACTIVE",
+  "În așteptare": "ON_HOLD",
+  "In asteptare": "ON_HOLD",
+  "Finalizat": "DONE",
+  "Arhivat": "ARCHIVED",
+};
+
+export const RO_TO_APPT_STATUS: Record<string, string> = {
+  "Nou": "NEW",
+  "Confirmat": "CONFIRMED",
+  "În lucru": "IN_PROGRESS",
+  "In lucru": "IN_PROGRESS",
+  "Finalizat": "DONE",
+  "Anulat": "CANCELLED",
+  "Absent": "NO_SHOW",
+  // formele din aplicație (la feminin: „programare”)
+  "Nouă": "NEW",
+  "Confirmată": "CONFIRMED",
+  "Finalizată": "DONE",
+  "Anulată": "CANCELLED",
+  "Absentă": "NO_SHOW",
+};
+
+/**
+ * Parsează un string dată în format românesc "ZZ.LL.AAAA" sau ISO "AAAA-LL-ZZ".
+ * Returnează dateKey "AAAA-LL-ZZ" sau null dacă formatul nu este recunoscut.
+ */
+export function parseRoDateKey(s: string): string | null {
+  s = s.trim();
+  // DD.MM.YYYY
+  const ro = s.match(/^(\d{1,2})\.(\d{1,2})\.(\d{4})$/);
+  if (ro) {
+    const [, d, m, y] = ro;
+    const key = `${y}-${m.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    return isValidDateKey(key) ? key : null;
+  }
+  // YYYY-MM-DD
+  const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) return isValidDateKey(iso[0]) ? iso[0] : null;
+  return null;
+}
+
+/**
+ * Parsează "HH:mm" sau "H:mm" și returnează același format normalizat sau null.
+ */
+export function parseTime(s: string): string | null {
+  const m = s.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return null;
+  const h = m[1].padStart(2, "0");
+  const min = m[2];
+  if (Number(h) > 23 || Number(min) > 59) return null;
+  return `${h}:${min}`;
+}
+
+export type ImportResult = {
+  imported: number;
+  total: number;
+  failed: { row: number; error: string }[];
+};
+
+const norm = (v: string) => v.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
+
+/** Caută o etichetă într-o hartă fără să conteze majusculele, diacriticele și spațiile din capete („in lucru”, „URGENTA”, „ în lucru ”). */
+export function mapLabel<T extends string>(map: Record<string, T>, raw: string | undefined | null): T | undefined {
+  const v = (raw ?? "").trim();
+  if (!v) return undefined;
+  if (map[v] !== undefined) return map[v];
+  const n = norm(v);
+  for (const [k, val] of Object.entries(map)) if (norm(k) === n) return val;
+  return undefined;
+}

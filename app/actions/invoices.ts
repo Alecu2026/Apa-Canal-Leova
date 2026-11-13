@@ -1,0 +1,273 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { prisma } from "@/lib/prisma";
+import { after } from "next/server";
+import { requireUser, type CurrentUser } from "@/lib/dal";
+import { can } from "@/lib/permissions";
+import { DEMO } from "@/lib/demo";
+import { apaCanalDueDate } from "@/lib/apa-canal-due";
+import { createInvoice, updateInvoice, refreshClientInvoiceSnapshot, type ApaCanalInput } from "@/lib/services/invoices";
+import { invalidatePayers } from "@/lib/services/payer-cache";
+import { syncInvoiceToCache } from "@/lib/services/invoice-cache";
+import { getSettings } from "@/lib/queries/settings";
+import { logAudit } from "@/lib/services/audit";
+import { INVOICE_SPEC, diffFields } from "@/lib/services/audit-diff";
+import { notifyUsers, observerRecipients } from "@/lib/services/notifications";
+import { sendInvoiceEmail } from "@/lib/email";
+import { env } from "@/lib/env";
+import type { InvoiceStatus, InvoiceKind } from "@prisma/client";
+
+const actor = (u: CurrentUser) => ({ id: u.id, name: u.name, role: u.role, isSuperAdmin: u.isSuperAdmin });
+
+/**
+ * Trimite email clientului dacă factura are status SENT și clientul are email.
+ * `recipientOverride` — folosit când clientul facturii tocmai s-a schimbat: fostul client
+ * (dinainte de editare) primește aceeași factură pe email ca înștiințare, alături de noul
+ * client (care oricum o primește prin apelul normal, fără override, pe clientul curent al
+ * facturii). Fără asta, dacă factura fusese legată greșit de alt client și se corectează,
+ * doar noul client afla — fostul rămânea cu impresia (greșită) că factura e valabilă pe numele lui.
+ */
+function notifyClientEmail(invoiceId: string, recipientOverride?: { email: string; name: string }) {
+  after(async () => {
+    try {
+      const inv = await prisma.invoice.findUnique({
+        where: { id: invoiceId },
+        select: {
+          number: true,
+          grandTotal: true,
+          currency: true,
+          dueDate: true,
+          publicToken: true,
+          status: true,
+          userId: true,
+          client: { select: { name: true, email: true } },
+        },
+      });
+      if (!inv || inv.status !== "SENT") return;
+      const recipient = recipientOverride ?? (inv.client?.email ? { email: inv.client.email, name: inv.client.name } : null);
+      if (!recipient) {
+        console.warn(`[invoices] email neconfigurat/lipsă pentru clientul facturii ${inv.number} — trimitere sărită`);
+        return;
+      }
+      const [company, senderSettings] = await Promise.all([
+        prisma.companySettings.findFirst({ where: { singleton: "main" }, select: { companyName: true } }),
+        getSettings(inv.userId),
+      ]);
+      await sendInvoiceEmail({
+        to: recipient.email,
+        clientName: recipient.name,
+        invoiceNumber: inv.number,
+        grandTotal: inv.grandTotal,
+        currency: inv.currency,
+        dueDate: inv.dueDate,
+        publicUrl: `${env.appUrl}/invoice/public/${inv.publicToken}`,
+        companyName: company?.companyName || null,
+        fromName: senderSettings.emailFromName || null,
+        fromAddr: senderSettings.emailFromAddr || null,
+      });
+      console.log(`[invoices] email factură ${inv.number} trimis către ${recipient.email}`);
+    } catch (e) {
+      console.error(`[invoices] eșec trimitere email factură ${invoiceId}:`, e);
+    }
+  });
+}
+
+/** Notifică observatorii (eveniment factură), în fundal, fără actor. */
+function notifyInvoiceEvent(eventKey: string, title: string, actorId: string) {
+  after(async () => {
+    try {
+      const ids = (await observerRecipients(eventKey)).filter((id) => id !== actorId);
+      if (ids.length) await notifyUsers(ids, { title, url: "/invoices" }, { telegram: true });
+    } catch {
+      /* best-effort */
+    }
+  });
+}
+
+export type InvoicePayload = {
+  id?: string;
+  status: InvoiceStatus;
+  kind?: InvoiceKind;
+  issueDate: string; // YYYY-MM-DD
+  dueDate: string | null;
+  clientId: string | null;
+  projectId: string | null;
+  taskIds: string[];
+  notes: string;
+  terms: string;
+  items: { description: string; quantity: number; unitPrice: number; taxRate: number }[];
+  apaCanal?: ApaCanalInput;
+};
+
+export type InvoiceActionResult = { ok: boolean; id?: string; error?: string };
+
+const STATUSES: InvoiceStatus[] = ["DRAFT", "SENT", "PAID", "CANCELLED", "OVERDUE"];
+
+function toDate(s: string | null): Date | null {
+  if (!s || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  return new Date(`${s}T12:00:00`);
+}
+
+export async function saveInvoice(payload: InvoicePayload): Promise<InvoiceActionResult> {
+  const user = await requireUser();
+  const needed = payload.id ? "invoices.edit" : "invoices.create";
+  if (!can(user, needed)) return { ok: false, error: "Fără permisiune." };
+  if (DEMO) return { ok: false, error: "Mod demo: conectează o bază de date." };
+
+  if (!payload.items || payload.items.length === 0) {
+    return { ok: false, error: "Adaugă cel puțin un rând în factură." };
+  }
+  const status = STATUSES.includes(payload.status) ? payload.status : "DRAFT";
+
+  // Reținem clientul dinaintea editării, ca să detectăm o schimbare de client la salvare și
+  // să anunțăm și fostul client (vezi notifyClientEmail) — altfel, dacă factura fusese legată
+  // greșit de alt client, doar noul client afla la corectare.
+  const previousClient = payload.id
+    ? await prisma.invoice.findUnique({
+        where: { id: payload.id },
+        select: { clientId: true, status: true, issueDate: true, dueDate: true, grandTotal: true, notes: true, client: { select: { name: true, email: true } } },
+      })
+    : null;
+
+  const issueDate = toDate(payload.issueDate) ?? new Date();
+  const input = {
+    status,
+    kind: payload.kind ?? "STANDARD" as InvoiceKind,
+    issueDate,
+    // Facturile Apă-Canal au mereu scadența pe 25 a lunii facturii (indiferent ce trimite formularul); celelalte — cea aleasă.
+    dueDate: payload.kind === "APA_CANAL" ? apaCanalDueDate(issueDate) : toDate(payload.dueDate),
+    clientId: payload.clientId,
+    projectId: payload.projectId,
+    taskIds: payload.taskIds,
+    notes: payload.notes,
+    terms: payload.terms,
+    items: payload.items,
+    apaCanal: payload.apaCanal,
+  };
+
+  const res = payload.id
+    ? await updateInvoice(payload.id, input)
+    : await createInvoice(user.id, input);
+
+  if (!res.ok) return { ok: false, error: res.error };
+  const inv = await prisma.invoice.findUnique({ where: { id: res.id }, select: { number: true, status: true, issueDate: true, dueDate: true, grandTotal: true, notes: true, client: { select: { name: true } } } });
+  await logAudit(actor(user), {
+    action: payload.id ? "invoice.update" : "invoice.create",
+    module: "Invoices",
+    objectId: res.id,
+    objectName: inv?.number ?? null,
+    newValue: status,
+    details: inv
+      ? payload.id && previousClient
+        ? { changes: diffFields({ ...previousClient, client: previousClient.client?.name ?? null }, { ...inv, client: inv.client?.name ?? null }, INVOICE_SPEC) }
+        : {
+            extra: [
+              { label: "Client", value: inv.client?.name ?? "—" },
+              { label: "Total", value: `${inv.grandTotal.toFixed(2)} ${payload.kind === "APA_CANAL" ? "MDL" : ""}`.trim() },
+              { label: "Rânduri", value: String(payload.items.length) },
+            ],
+          }
+      : null,
+  });
+  if (!payload.id) {
+    notifyInvoiceEvent("invoice.created", `Factură nouă: ${inv?.number ?? ""}`.trim(), user.id);
+  }
+  await refreshClientInvoiceSnapshot(payload.clientId);
+  if (previousClient?.clientId && previousClient.clientId !== payload.clientId) {
+    await refreshClientInvoiceSnapshot(previousClient.clientId);
+  }
+  await invalidatePayers();
+  if (status === "SENT") {
+    notifyClientEmail(res.id!);
+    const clientChanged = !!previousClient?.clientId && previousClient.clientId !== payload.clientId;
+    if (clientChanged && previousClient?.client?.email) {
+      notifyClientEmail(res.id!, { email: previousClient.client.email, name: previousClient.client.name });
+    }
+  }
+  revalidatePath("/invoices");
+  return { ok: true, id: res.id };
+}
+
+export type QuickDraftResult = { ok: true; id: string } | { ok: false; error: string };
+
+/** Crează o factură DRAFT minimă — pentru dialogul vocal (utilizatorul o editează după). */
+export async function quickDraftInvoice(opts: {
+  title?: string;
+  clientId?: string;
+  projectId?: string;
+  dueDate?: string;
+  notes?: string;
+  items?: { description: string; qty?: number; unitPrice?: number }[];
+}): Promise<QuickDraftResult> {
+  const user = await requireUser();
+  if (!can(user, "invoices.create")) return { ok: false, error: "Fără permisiune." };
+  if (DEMO) return { ok: false, error: "Mod demo: conectează o bază de date." };
+
+  const lineItems = opts.items?.length
+    ? opts.items.map((i) => ({
+        description: i.description || "Serviciu",
+        quantity: i.qty ?? 1,
+        unitPrice: i.unitPrice ?? 0,
+        taxRate: 0,
+      }))
+    : [{ description: opts.title || "Serviciu", quantity: 1, unitPrice: 0, taxRate: 0 }];
+
+  const today = new Date().toISOString().slice(0, 10);
+  const res = await saveInvoice({
+    status: "DRAFT",
+    issueDate: today,
+    dueDate: opts.dueDate ?? null,
+    clientId: opts.clientId ?? null,
+    projectId: opts.projectId ?? null,
+    taskIds: [],
+    notes: opts.notes ?? opts.title ?? "",
+    terms: "",
+    items: lineItems,
+  });
+
+  return res.ok ? { ok: true, id: res.id! } : { ok: false, error: res.error ?? "Eroare" };
+}
+
+export async function setInvoiceStatus(
+  id: string,
+  status: string,
+): Promise<InvoiceActionResult> {
+  const user = await requireUser();
+  if (!can(user, "invoices.edit")) return { ok: false, error: "Fără permisiune." };
+  if (DEMO) return { ok: false, error: "Mod demo." };
+  if (!STATUSES.includes(status as InvoiceStatus)) return { ok: false, error: "Status invalid." };
+  const before = await prisma.invoice.findUnique({ where: { id }, select: { number: true, status: true, clientId: true, paidAt: true } });
+  // Data achitării: se fixează la prima marcare ca „Plătită" și se șterge dacă statusul se schimbă înapoi.
+  const paidAt = status === "PAID" ? (before?.paidAt ?? new Date()) : null;
+  await prisma.invoice.update({ where: { id }, data: { status: status as InvoiceStatus, paidAt } });
+  await refreshClientInvoiceSnapshot(before?.clientId);
+  await invalidatePayers();
+  await syncInvoiceToCache(id); // aplică factura în luna ei din memorie și marchează doar luna aceea
+  await logAudit(actor(user), {
+    action: "invoice.status_change",
+    module: "Invoices",
+    objectId: id,
+    objectName: before?.number ?? null,
+    oldValue: before?.status ?? null,
+    newValue: status,
+  });
+  notifyInvoiceEvent("invoice.status", `Factură ${before?.number ?? ""}: status ${status}`.trim(), user.id);
+  if (status === "SENT") notifyClientEmail(id);
+  revalidatePath("/invoices");
+  return { ok: true };
+}
+
+export async function deleteInvoice(id: string): Promise<void> {
+  const user = await requireUser();
+  if (!can(user, "invoices.delete")) return;
+  if (DEMO) return;
+  const inv = await prisma.invoice.findUnique({ where: { id }, select: { number: true, clientId: true } });
+  await prisma.invoiceItem.deleteMany({ where: { invoiceId: id } });
+  await prisma.invoice.delete({ where: { id } }).catch(() => {});
+  await refreshClientInvoiceSnapshot(inv?.clientId);
+  await invalidatePayers();
+  await syncInvoiceToCache(id); // aplică factura în luna ei din memorie și marchează doar luna aceea
+  await logAudit(actor(user), { action: "invoice.delete", module: "Invoices", objectId: id, objectName: inv?.number ?? null });
+  revalidatePath("/invoices");
+}

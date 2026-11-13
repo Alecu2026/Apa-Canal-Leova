@@ -1,0 +1,1573 @@
+import "server-only";
+import { prisma } from "../prisma";
+import { DEMO } from "../demo";
+import {
+  sendMessage,
+  editMessageText,
+  deleteMessage,
+  sendPhoto,
+  sendDocument,
+  taskStatusButtons,
+  taskOpenButton,
+  TASK_STATUS_RO,
+  TASK_TYPE_RO,
+  TASK_PRIORITY_RO,
+} from "../telegram";
+import { formatTime, formatDate, DEFAULT_TZ, todayKey } from "../date";
+import { notifyClientTicketClosed } from "./ticket-client-notify";
+import { validateResolution, type Resolution } from "../resolution";
+import { can, canCancelTask, canViewTask } from "../permissions";
+import { env } from "../env";
+import { absoluteUrl } from "../storage";
+import { notifyUsers, observerRecipients, filteredAdminRecipients } from "./notifications";
+import { Prisma } from "@prisma/client";
+import { parseServiceType, SERVICE_TYPE_LABEL } from "../service-type";
+import { parseConsumerType, CONSUMER_TYPE_LABEL } from "../consumer-type";
+import type { TaskStatus, TaskType, TaskPriority, CreatedFrom } from "@prisma/client";
+import { computeNextRun, parseReminderSchedule, type ReminderSchedule } from "../reminder-schedule";
+
+/** Contor atomic (MongoDB nu are autoincrement nativ) — folosit pentru Task.seq. */
+async function nextSeq(name: string): Promise<number> {
+  const counter = await prisma.counter.upsert({
+    where: { name },
+    create: { name, value: 1 },
+    update: { value: { increment: 1 } },
+    select: { value: true },
+  });
+  return counter.value;
+}
+
+export type AssignmentSetting = {
+  userId?: string;
+  teamId?: string;
+  notifyUntilStatus?: string | null;
+};
+
+const STATUS_ORDER: string[] = [
+  "NEW", "ASSIGNED", "READ", "IN_PROGRESS", "ON_HOLD", "REVIEW", "DONE", "CANCELLED",
+];
+
+function shouldNotifyByThreshold(
+  settings: AssignmentSetting[],
+  recipientId: string,
+  isTeam: boolean,
+  newStatus: string,
+): boolean {
+  const s = settings.find((x) => (isTeam ? x.teamId === recipientId : x.userId === recipientId));
+  if (!s?.notifyUntilStatus) return true;
+  return STATUS_ORDER.indexOf(newStatus) <= STATUS_ORDER.indexOf(s.notifyUntilStatus);
+}
+
+export type CreateTaskInput = {
+  title: string;
+  description?: string;
+  type?: TaskType;
+  priority?: TaskPriority;
+  dueAt?: Date | null;
+  assigneeId?: string | null;
+  teamId?: string | null;
+  extraAssigneeIds?: string[];
+  extraTeamIds?: string[];
+  assignmentSettingsJson?: string | null;
+  projectId?: string | null;
+  clientId?: string | null;
+  categoryId?: string | null;
+  /** Adresa locului intervenției (text). */
+  address?: string | null;
+  /** Tipul serviciului (WATER / SEWER / BOTH), gol = nespecificat. */
+  serviceType?: string | null;
+  /** Categoria consumatorului (HOUSEHOLD / NON_HOUSEHOLD), gol = nespecificat. */
+  consumerType?: string | null;
+  /** Secția (Section); gol = se deduce din echipele și persoanele atribuite. */
+  sectionId?: string | null;
+  /** Șablonul intern din care s-a creat (id + numele lui), pentru numărătoarea din exportul de cereri. */
+  taskTemplateId?: string | null;
+  taskTemplateName?: string | null;
+  reminderIntervalMinutes?: number | null;
+  /** Reamintire programată (are prioritate față de intervalul fix). */
+  reminderSchedule?: ReminderSchedule | null;
+  bypassQuietHours?: boolean;
+};
+
+/** Chat Telegram al unui user: întâi cel setat manual, apoi contul linkat prin bot. */
+async function telegramChatFor(userId: string): Promise<string | null> {
+  const u = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { telegramChatId: true, telegramAccounts: { select: { chatId: true }, take: 1 } },
+  });
+  return u?.telegramChatId || u?.telegramAccounts[0]?.chatId || null;
+}
+
+/** URL-ul PWA pentru un task (pagina dedicată de detalii). */
+function taskUrl(taskId: string): string {
+  return `${env.appUrl}/tasks/${taskId}`;
+}
+
+/** "#123" ca hyperlink HTML — textul "#N" este el însuși ancora, clic-abil în Telegram. */
+function taskRef(seq: number | null | undefined, taskId: string): string {
+  const label = seq != null ? `#${seq}` : "#—";
+  return `<a href="${taskUrl(taskId)}">${label}</a>`;
+}
+
+/** Mesaj Telegram dedicat schimbării de status/progres/comentariu (format fix, lizibil). */
+function taskUpdateTelegramText(
+  actorName: string,
+  taskTitle: string,
+  statusLabel: string,
+  taskId: string,
+  seq: number | null | undefined,
+  lineLabel: string = "Status",
+): string {
+  const time = formatTime(new Date(), DEFAULT_TZ);
+  return [
+    "🔔 <b>Actualizare sarcină</b>",
+    "",
+    `Lucrător: ${escapeHtml(actorName)}`,
+    `Sarcină: ${escapeHtml(taskTitle)} (${taskRef(seq, taskId)})`,
+    `${lineLabel}: <b>${escapeHtml(statusLabel)}</b>`,
+    `Ora: ${time}`,
+  ].join("\n");
+}
+
+/** Mesaj Telegram pentru task întârziat (fără actor — notificare automată). */
+function taskOverdueTelegramText(taskTitle: string, taskId: string, seq: number | null | undefined): string {
+  const time = formatTime(new Date(), DEFAULT_TZ);
+  return [
+    "⏰ <b>Sarcină în întârziere</b>",
+    "",
+    `Sarcină: ${escapeHtml(taskTitle)} (${taskRef(seq, taskId)})`,
+    `Ora: ${time}`,
+  ].join("\n");
+}
+
+/** Trimite mesajul de actualizare pe Telegram către fiecare destinatar cu chat legat (best-effort, logat). */
+async function notifyTaskUpdateTelegram(
+  userIds: string[],
+  info: {
+    actorName: string;
+    taskTitle: string;
+    statusLabel: string;
+    taskId: string;
+    seq: number | null | undefined;
+    lineLabel?: string;
+  },
+): Promise<void> {
+  const text = taskUpdateTelegramText(
+    info.actorName,
+    info.taskTitle,
+    info.statusLabel,
+    info.taskId,
+    info.seq,
+    info.lineLabel,
+  );
+  await Promise.all(
+    userIds.map(async (uid) => {
+      try {
+        const chatId = await telegramChatFor(uid);
+        if (!chatId) {
+          console.log(`[tasks] telegram: user ${uid} nu are chat Telegram legat — sărit`);
+          return;
+        }
+        const res = await sendMessage(chatId, text, taskOpenButton(info.seq, info.taskId));
+        if (!res) {
+          console.error(`[tasks] telegram: sendMessage a eșuat pentru user ${uid}`);
+        }
+      } catch (e) {
+        console.error(`[tasks] telegram: notificare eșuată pentru user ${uid}`, e);
+      }
+    }),
+  );
+}
+
+/** Trimite mesajul de „task întârziat" pe Telegram (fără actor — notificare automată). */
+async function notifyTaskOverdueTelegram(
+  userIds: string[],
+  taskTitle: string,
+  taskId: string,
+  seq: number | null | undefined,
+): Promise<void> {
+  const text = taskOverdueTelegramText(taskTitle, taskId, seq);
+  await Promise.all(
+    userIds.map(async (uid) => {
+      try {
+        const chatId = await telegramChatFor(uid);
+        if (!chatId) return;
+        const res = await sendMessage(chatId, text, taskOpenButton(seq, taskId));
+        if (!res) console.error(`[tasks] telegram: sendMessage (overdue) a eșuat pentru user ${uid}`);
+      } catch (e) {
+        console.error(`[tasks] telegram: notificare overdue eșuată pentru user ${uid}`, e);
+      }
+    }),
+  );
+}
+
+/** Textul notificării in-app, exact pe tipul de tranziție (cerut de spec). */
+function taskLabel(seq: number | null | undefined, title: string): string {
+  const t = title.length > 40 ? `${title.slice(0, 40)}…` : title;
+  return seq != null ? `#${seq} · ${t}` : t;
+}
+
+type TaskAccessShape = {
+  creatorId: string;
+  assigneeId: string | null;
+  extraAssigneeIds: string[] | null;
+  teamId: string | null;
+  extraTeamIds: string[] | null;
+};
+
+/** Poate actorul schimba statusul / progresul? Cu „Editare" (sau administrator), cu „Schimbare status" pe task-urile pe care le vede, sau dacă e implicat în task (creator, responsabil, echipă). */
+async function actorMayWorkOnTask(actorId: string, task: TaskAccessShape & { type?: string }, closing: "DONE" | "CANCELLED" | false = false): Promise<boolean> {
+  const u = await prisma.user.findUnique({
+    where: { id: actorId },
+    select: { role: true, permissions: true, teamIds: true, taskViewScope: true, taskViewTeamIds: true, taskViewMemberIds: true },
+  });
+  if (!u) return false;
+  if (can(u, "tasks.edit")) return true;
+  // „Schimbare status”: orice task pe care are voie să-l vadă (ale lui, plus cele ale altor persoane / echipe din vizibilitatea contului)
+  if (can(u, "tasks.status") && canViewTask({ id: actorId, teamIds: u.teamIds, taskViewScope: u.taskViewScope, taskViewTeamIds: u.taskViewTeamIds, taskViewMemberIds: u.taskViewMemberIds }, { creatorId: task.creatorId, assigneeId: task.assigneeId, extraAssigneeIds: task.extraAssigneeIds ?? [], teamId: task.teamId, extraTeamIds: task.extraTeamIds ?? [] })) return true;
+  // „Închidere / finalizare" (finalizare) și „Anulare sarcini / cereri" (anulare): poți finaliza / anula orice task, dar nu schimba alte statusuri la task-urile străine.
+  if (closing === "DONE" && can(u, "tasks.close")) return true;
+  if (closing === "CANCELLED" && canCancelTask(u, task.type ?? "TASK")) return true;
+  return actorHasTaskAccess(actorId, task);
+}
+
+/** Are actorul (care acționează din Telegram) voie pe task? Administrator, creator, asignat direct sau prin echipă. */
+async function actorHasTaskAccess(actorId: string, task: TaskAccessShape): Promise<boolean> {
+  const actorUser = await prisma.user.findUnique({ where: { id: actorId }, select: { teamIds: true, role: true } });
+  if (actorUser?.role === "ADMIN") return true;
+  const actorTeams = actorUser?.teamIds ?? [];
+  const isCreator = task.creatorId === actorId;
+  const isDirectlyAssigned = task.assigneeId === actorId || (task.extraAssigneeIds ?? []).includes(actorId);
+  const isTeamAssigned =
+    (!!task.teamId && actorTeams.includes(task.teamId)) || (task.extraTeamIds ?? []).some((tid) => actorTeams.includes(tid));
+  return isCreator || isDirectlyAssigned || isTeamAssigned;
+}
+
+/** Același test, pornind de la id-ul task-ului (folosit de bot înainte de a porni fluxul de comentariu). */
+export async function userCanActOnTask(actorId: string, taskId: string): Promise<boolean> {
+  if (DEMO) return false;
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: { creatorId: true, assigneeId: true, extraAssigneeIds: true, teamId: true, extraTeamIds: true },
+  });
+  return !!task && (await actorHasTaskAccess(actorId, task));
+}
+
+/** Toți utilizatorii care răspund de un task: asignatul, co-asignații și membrii echipelor (principală + extra). */
+async function assignedUserSet(a: { assigneeId: string | null; extraAssigneeIds: string[]; teamId: string | null; extraTeamIds: string[] }): Promise<Set<string>> {
+  const out = new Set<string>();
+  if (a.assigneeId) out.add(a.assigneeId);
+  for (const id of a.extraAssigneeIds) out.add(id);
+  for (const tid of [a.teamId, ...a.extraTeamIds]) {
+    if (!tid) continue;
+    const team = await prisma.team.findUnique({ where: { id: tid }, select: { memberIds: true } });
+    team?.memberIds.forEach((id) => out.add(id));
+  }
+  return out;
+}
+
+type TaskCardShape = {
+  id: string;
+  seq: number | null;
+  title: string;
+  description: string | null;
+  priority: TaskPriority;
+  status: TaskStatus;
+  assignee: { name: string } | null;
+  project: { name: string; lat: number | null; lng: number | null; address: string | null } | null;
+  /** Adresa task-ului (are prioritate față de cea a proiectului). */
+  address?: string | null;
+};
+
+/** Cardul Telegram al unui task (antet + titlu + descriere + prioritate + asignat + proiect + status + hărți) — același pentru „task nou” și „task asignat”. */
+function taskCardText(task: TaskCardShape, header: string): string {
+  const lines = [header, `<b>${escapeHtml(task.title)}</b>`];
+  if (task.description?.trim()) {
+    lines.push("", escapeHtml(task.description.trim()));
+  }
+  lines.push("", `⚑ Prioritate: <b>${TASK_PRIORITY_RO[task.priority]}</b>`);
+  if (task.assignee?.name) lines.push(`👤 Asignat: ${escapeHtml(task.assignee.name)}`);
+  if (task.project?.name) lines.push(`📁 Proiect: ${escapeHtml(task.project.name)}`);
+  if (task.address?.trim()) lines.push(`🏠 Adresă: ${escapeHtml(task.address.trim())}`);
+  lines.push(`Status: <b>${TASK_STATUS_RO[task.status]}</b>`);
+  const proj = task.project;
+  if (proj?.lat != null && proj?.lng != null) {
+    lines.push(
+      `📍 <a href="https://www.google.com/maps?q=${proj.lat},${proj.lng}">Google Maps</a>` +
+      ` | <a href="https://waze.com/ul?ll=${proj.lat},${proj.lng}&navigate=yes">Waze</a>` +
+      ` | <a href="https://maps.apple.com/?ll=${proj.lat},${proj.lng}">Apple Maps</a>`,
+    );
+  } else if (task.address?.trim() || proj?.address) {
+    lines.push(`📍 <a href="https://www.google.com/maps?q=${encodeURIComponent((task.address?.trim() || proj?.address) as string)}">Google Maps</a>`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Anunță persoanele ADĂUGATE ca responsabili la editarea unui task (asignat nou, co-asignat nou, membri ai unei echipe noi):
+ * card Telegram cu butoane de status + notificare in-app. Fără asta, doar cei de dinainte aflau de modificare.
+ */
+export async function notifyTaskAssigned(taskId: string, userIds: string[], actorName: string): Promise<void> {
+  try {
+    if (DEMO || userIds.length === 0) return;
+    const task = await prisma.task.findUnique({
+      where: { id: taskId },
+      select: {
+        id: true, seq: true, title: true, description: true, type: true, priority: true, status: true, address: true,
+        assigneeId: true, assignmentSettingsJson: true,
+        assignee: { select: { name: true } },
+        project: { select: { name: true, lat: true, lng: true, address: true } },
+      },
+    });
+    if (!task) return;
+    const settings: AssignmentSetting[] = task.assignmentSettingsJson ? (JSON.parse(task.assignmentSettingsJson) as AssignmentSetting[]) : [];
+    const text =
+      taskCardText(task, `📌 <b>${TASK_TYPE_RO[task.type]} asignat ție</b> (${taskRef(task.seq, task.id)})`) +
+      `\n✏️ De: ${escapeHtml(actorName)}`;
+    let stored = false;
+    for (const uid of userIds) {
+      try {
+        if (!shouldNotifyByThreshold(settings, uid, false, task.status)) continue;
+        const chatId = await telegramChatFor(uid);
+        if (!chatId) continue;
+        const res = (await sendMessage(chatId, text, taskStatusButtons(task.id))) as { message_id?: number } | null;
+        // mesajul noului asignat devine cel editat la următoarele schimbări de status din Telegram
+        if (res?.message_id && uid === task.assigneeId && !stored) {
+          await prisma.task.update({ where: { id: task.id }, data: { telegramChatId: chatId, telegramMessageId: res.message_id } }).catch(() => {});
+          stored = true;
+        }
+      } catch {
+        // ignoră eșecul per-destinatar
+      }
+    }
+    await notifyUsers(
+      userIds,
+      {
+        title: `${TASK_TYPE_RO[task.type]} asignat: ${taskLabel(task.seq, task.title)}`,
+        body: `de ${actorName}`,
+        taskId: task.id,
+        seq: task.seq,
+        url: `/tasks/${task.id}`,
+      },
+      { telegram: false },
+    );
+  } catch (e) {
+    console.error(`[tasks] notifyTaskAssigned: eșuat pentru task ${taskId}`, e);
+  }
+}
+
+/** Secția dedusă din cine se ocupă: întâi echipele atribuite (secția echipei), apoi persoanele atribuite (secția persoanei). Null dacă niciuna nu are secție. */
+export async function deriveTaskSectionId(teamIds: (string | null | undefined)[], userIds: (string | null | undefined)[]): Promise<string | null> {
+  const ok = (ids: (string | null | undefined)[]) => [...new Set(ids.filter((x): x is string => !!x && /^[0-9a-f]{24}$/i.test(x)))];
+  const teams = ok(teamIds);
+  if (teams.length) {
+    const found = await prisma.team.findMany({ where: { id: { in: teams } }, select: { id: true, sectionId: true } });
+    for (const id of teams) { const s = found.find((x) => x.id === id)?.sectionId; if (s) return s; }
+  }
+  const users = ok(userIds);
+  if (users.length) {
+    const found = await prisma.user.findMany({ where: { id: { in: users } }, select: { id: true, sectionId: true } });
+    for (const id of users) { const s = found.find((x) => x.id === id)?.sectionId; if (s) return s; }
+  }
+  return null;
+}
+
+/** Secția aleasă pentru o cerere / sarcină: doar una care există (o secție ștearsă între timp, într-un formular rămas deschis, se ignoră). */
+async function existingSectionId(v: unknown): Promise<string | null> {
+  if (typeof v !== "string" || !/^[0-9a-f]{24}$/i.test(v)) return null;
+  return (await prisma.section.findUnique({ where: { id: v }, select: { id: true } }).catch(() => null))?.id ?? null;
+}
+
+/**
+ * Creează un task. NU trimite notificări aici (ca o problemă de Telegram să NU
+ * pice crearea). Pentru notificări apelează separat `notifyNewTask`.
+ */
+export async function createTask(
+  creatorId: string,
+  input: CreateTaskInput,
+  source: CreatedFrom = "WEB",
+) {
+  if (DEMO) return { ok: false as const, error: "Mod demo: conectează o bază de date." };
+  if (!input.title?.trim()) return { ok: false as const, error: "Titlul e obligatoriu." };
+
+  let assigneeId = input.assigneeId || null;
+  let teamId = input.teamId || null;
+  let clientId: string | null = null;
+
+  if (input.projectId) {
+    const project = await prisma.project.findUnique({
+      where: { id: input.projectId },
+      select: { assigneeId: true, teamId: true, clientId: true },
+    });
+    if (project) {
+      clientId = project.clientId ?? null;
+      if (!assigneeId && !teamId) {
+        assigneeId = project.assigneeId;
+        teamId = project.teamId;
+      }
+    }
+  } else {
+    clientId = input.clientId || null;
+  }
+  if (!assigneeId && !teamId) assigneeId = creatorId;
+
+  // Asignat cuiva => ASSIGNED; altfel NEW
+  const status: TaskStatus = assigneeId || teamId ? "ASSIGNED" : "NEW";
+  const seq = await nextSeq("task");
+  // secția: cea aleasă în formular, altfel cea a echipelor / persoanelor atribuite
+  const sectionId = (await existingSectionId(input.sectionId)) ?? (await deriveTaskSectionId([teamId, ...(input.extraTeamIds ?? [])], [assigneeId, ...(input.extraAssigneeIds ?? [])]));
+
+  const schedule = input.reminderSchedule ?? null;
+  const intervalMin = schedule ? null : input.reminderIntervalMinutes || null;
+  const nextReminderAt = schedule ? computeNextRun(schedule, new Date()) : intervalMin ? new Date(Date.now() + intervalMin * 60_000) : null;
+
+  const task = await prisma.task.create({
+    data: {
+      seq,
+      title: input.title.trim(),
+      description: input.description?.trim() || null,
+      type: input.type ?? "TASK",
+      priority: input.priority ?? "MEDIUM",
+      dueAt: input.dueAt ?? null,
+      creatorId,
+      assigneeId,
+      teamId,
+      extraAssigneeIds: input.extraAssigneeIds ?? [],
+      extraTeamIds: input.extraTeamIds ?? [],
+      assignmentSettingsJson: input.assignmentSettingsJson ?? null,
+      projectId: input.projectId || null,
+      categoryId: input.categoryId || null,
+      address: input.address?.trim().slice(0, 300) || null,
+      serviceType: parseServiceType(input.serviceType),
+      consumerType: parseConsumerType(input.consumerType),
+      ...(sectionId ? { sectionId } : {}),
+      ...(input.taskTemplateId ? { taskTemplateId: input.taskTemplateId, taskTemplateName: input.taskTemplateName?.slice(0, 120) || null } : {}),
+      clientId,
+      createdFrom: source,
+      status,
+      reminderIntervalMinutes: intervalMin,
+      ...(schedule ? { reminderSchedule: schedule as unknown as Prisma.InputJsonValue } : {}),
+      nextReminderAt,
+      bypassQuietHours: input.bypassQuietHours ?? false,
+    },
+    select: { id: true, title: true, seq: true },
+  });
+
+  return { ok: true as const, id: task.id, title: task.title, seq: task.seq };
+}
+
+/** Trimite notificarea de task nou către asignat / membrii echipei (best-effort). */
+export async function notifyNewTask(taskId: string): Promise<void> {
+  try {
+    const task = await prisma.task.findUnique({
+      where: { id: taskId },
+      select: {
+        id: true,
+        seq: true,
+        title: true,
+        description: true,
+        type: true,
+        priority: true,
+        status: true,
+        address: true,
+        creatorId: true,
+        assigneeId: true,
+        teamId: true,
+        extraAssigneeIds: true,
+        extraTeamIds: true,
+        assignmentSettingsJson: true,
+        assignee: { select: { name: true, teamIds: true } },
+        project: { select: { name: true, lat: true, lng: true, address: true } },
+      },
+    });
+    if (!task) return;
+
+    const assignmentSettings: AssignmentSetting[] = task.assignmentSettingsJson
+      ? (JSON.parse(task.assignmentSettingsJson) as AssignmentSetting[])
+      : [];
+
+    const recipients = new Set<string>();
+    if (task.assigneeId) recipients.add(task.assigneeId);
+    if (task.teamId) {
+      const team = await prisma.team.findUnique({
+        where: { id: task.teamId },
+        select: { memberIds: true },
+      });
+      team?.memberIds.forEach((id) => recipients.add(id));
+    }
+    for (const uid of (task.extraAssigneeIds ?? [])) recipients.add(uid);
+    for (const tid of (task.extraTeamIds ?? [])) {
+      const team = await prisma.team.findUnique({ where: { id: tid }, select: { memberIds: true } });
+      team?.memberIds.forEach((id) => recipients.add(id));
+    }
+
+    const text = taskCardText(task, `🆕 <b>${TASK_TYPE_RO[task.type]} nou</b> (${taskRef(task.seq, task.id)})`);
+
+    let stored = false;
+    for (const uid of recipients) {
+      try {
+        if (!shouldNotifyByThreshold(assignmentSettings, uid, false, task.status)) continue;
+        const chatId = await telegramChatFor(uid);
+        if (!chatId) continue;
+        const res = (await sendMessage(chatId, text, taskStatusButtons(task.id))) as {
+          message_id?: number;
+        } | null;
+        if (res?.message_id && uid === task.assigneeId && !stored) {
+          await prisma.task
+            .update({
+              where: { id: task.id },
+              data: { telegramChatId: chatId, telegramMessageId: res.message_id },
+            })
+            .catch(() => {});
+          stored = true;
+        }
+      } catch {
+        // ignoră eșecul per-destinatar
+      }
+    }
+
+    // In-app + push pentru asignat/echipă (Telegram cu butoane a fost deja trimis mai sus)
+    await notifyUsers(
+      [...recipients],
+      {
+        title: `${TASK_TYPE_RO[task.type]} nou: ${taskLabel(task.seq, task.title)}`,
+        body: task.project?.name ? `Proiect: ${task.project.name}` : undefined,
+        taskId: task.id,
+        seq: task.seq,
+        url: `/tasks/${task.id}`,
+      },
+      { telegram: false },
+    );
+
+    // Observatori (staff cu evenimentul bifat) + administratori filtrați (echipă/membru/eveniment).
+    const createdKey = task.type === "TICKET" ? "ticket.created" : "task.created";
+    const eventKeys = task.assigneeId ? [createdKey, "task.assigned"] : [createdKey];
+    const admins = await filteredAdminRecipients({
+      eventKeys,
+      teamIds: [task.teamId, ...(task.assignee?.teamIds ?? [])],
+      memberIds: [task.assigneeId, task.creatorId],
+    });
+    const observerIds = new Set<string>([...admins, ...(await observerRecipients(createdKey))]);
+    if (task.assigneeId) {
+      for (const id of await observerRecipients("task.assigned")) observerIds.add(id);
+    }
+    observerIds.delete(task.creatorId); // creatorul știe deja
+    for (const id of recipients) observerIds.delete(id); // deja notificați ca direcți
+    console.log(`[tasks] notifyNewTask: ${observerIds.size} observatori/admini de notificat pentru task ${task.id}`);
+    if (observerIds.size > 0) {
+      await notifyUsers(
+        [...observerIds],
+        {
+          title: `${TASK_TYPE_RO[task.type]} nou: ${taskLabel(task.seq, task.title)}`,
+          body: task.assignee?.name
+            ? `Asignat: ${task.assignee.name}`
+            : task.project?.name
+              ? `Proiect: ${task.project.name}`
+              : undefined,
+          taskId: task.id,
+          seq: task.seq,
+          url: `/tasks/${task.id}`,
+        },
+        { telegram: true },
+      );
+    }
+  } catch (e) {
+    console.error(`[tasks] notifyNewTask: eșuat pentru task ${taskId}`, e);
+  }
+}
+
+/** Schimbă statusul + jurnal + notificare admin/creator (best-effort, logat). */
+export async function changeTaskStatus(
+  taskId: string,
+  actorId: string,
+  newStatus: TaskStatus,
+  opts: { fromTelegram?: boolean; /** „Măsuri luate” + timp de rezolvare: obligatorii la finalizarea unei cereri */ resolution?: Resolution | null } = {},
+) {
+  console.log(`[tasks] changeTaskStatus: task=${taskId} actor=${actorId} -> ${newStatus}`);
+  if (DEMO) return { ok: false as const, error: "Mod demo." };
+
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: {
+      id: true,
+      seq: true,
+      title: true,
+      description: true,
+      type: true,
+      status: true,
+      executedAt: true,
+      creatorId: true,
+      assigneeId: true,
+      teamId: true,
+      extraAssigneeIds: true,
+      extraTeamIds: true,
+      assignmentSettingsJson: true,
+      telegramChatId: true,
+      telegramMessageId: true,
+      reminderIntervalMinutes: true,
+      reminderSchedule: true,
+      assignee: { select: { teamIds: true } },
+      project: { select: { lat: true, lng: true, address: true } },
+    },
+  });
+  if (!task) {
+    console.error(`[tasks] changeTaskStatus: task ${taskId} nu există`);
+    return { ok: false as const, error: "Sarcină inexistentă." };
+  }
+  if (task.status === newStatus) {
+    console.log(`[tasks] changeTaskStatus: deja ${newStatus}, nimic de făcut`);
+    return { ok: true as const, changed: false, fromStatus: task.status, title: task.title, type: task.type, hadTelegramMessage: false };
+  }
+
+  // Fără „Editare" poți schimba statusul doar la task-urile în care ești implicat (și din Telegram, și din aplicație).
+  // Finalizarea unei CERERI cere „Măsuri luate” (și, opțional, timpul de rezolvare): fără ele, interfața le cere într-o fereastră și reia finalizarea.
+  // Din Telegram nu se pot completa: cererea se finalizează din aplicație.
+  if (newStatus === "DONE" && task.type === "TICKET") {
+    const bad = validateResolution(opts.resolution ?? {});
+    if (bad) {
+      return {
+        ok: false as const,
+        error: opts.fromTelegram ? "Cererea se finalizează din aplicație: completează „Măsuri luate” și timpul de rezolvare." : bad,
+        needsResolution: true,
+      };
+    }
+  }
+
+  if (!(await actorMayWorkOnTask(actorId, task, newStatus === "DONE" || newStatus === "CANCELLED" ? newStatus : false))) {
+    return { ok: false as const, error: opts.fromTelegram ? "Nu ai acces la această sarcină." : "Nu ai permisiunea de editare." };
+  }
+
+  const closed = newStatus === "DONE" || newStatus === "CANCELLED";
+  const wasClosed = task.status === "DONE" || task.status === "CANCELLED";
+  // Anularea cere permisiunea „Anulare sarcini” (sarcini) sau „Anulare cereri” (cereri), indiferent de cine lucrează la task.
+  // Finalizare: cine are permisiunea „Închidere / finalizare” o face liber. Ceilalți pot FINALIZA doar după ce au atașat
+  // o poză / un fișier informativ la acest task (dovada muncii făcute).
+  // Regula e aici (nu doar în acțiunea web), ca să fie valabilă și pentru butoanele din Telegram.
+  if (closed) {
+    const actorAcc = await prisma.user.findUnique({ where: { id: actorId }, select: { role: true, permissions: true } });
+    if (actorAcc && newStatus === "CANCELLED" && !canCancelTask(actorAcc, task.type)) {
+      return { ok: false as const, error: task.type === "TICKET" ? "Nu ai permisiunea de a anula cereri." : "Nu ai permisiunea de a anula sarcini.", needsProof: false };
+    }
+    if (actorAcc && newStatus === "DONE" && !can(actorAcc, "tasks.close")) {
+      const proofs = await prisma.taskAttachment.count({ where: { taskId, userId: actorId } });
+      if (proofs === 0) {
+        return {
+          ok: false as const,
+          error: "Ca să finalizezi sarcina, atașează mai întâi o poză sau un fișier informativ (în detaliile sarcinii), apoi finalizează-l.",
+          needsProof: true,
+        };
+      }
+    }
+  }
+  // Redeschis (din finalizat/anulat) un task cu reamintiri periodice: reamintirile pornesc din nou (la închidere se opriseră).
+  const savedSchedule = parseReminderSchedule(task.reminderSchedule);
+  const restartReminderAt =
+    wasClosed && !closed
+      ? savedSchedule
+        ? computeNextRun(savedSchedule, new Date())
+        : task.reminderIntervalMinutes
+          ? new Date(Date.now() + task.reminderIntervalMinutes * 60_000)
+          : null
+      : null;
+  await prisma.task.update({
+    where: { id: taskId },
+    data: {
+      status: newStatus,
+      ...(closed ? { nextReminderAt: null } : restartReminderAt ? { nextReminderAt: restartReminderAt } : {}),
+      // cerere finalizată: „Data executării” = azi, dacă echipa n-a setat-o deja (se poate corecta oricând)
+      ...(newStatus === "DONE" && task.type === "TICKET" && !task.executedAt ? { executedAt: new Date(`${todayKey(DEFAULT_TZ)}T00:00:00Z`) } : {}),
+      // când s-a închis (Finalizat / Anulat); redeschisă = gol. Măsurile și timpul se păstrează la redeschidere, iar o nouă finalizare le rescrie.
+      ...(closed ? { closedAt: new Date() } : wasClosed ? { closedAt: null } : {}),
+      ...(newStatus === "DONE" && task.type === "TICKET" && opts.resolution ? { measuresTaken: opts.resolution.measures.trim().slice(0, 2000), resolutionMinutes: opts.resolution.minutes ?? null } : {}),
+    },
+  });
+  await prisma.taskActivity
+    .create({ data: { taskId, userId: actorId, action: "STATUS_CHANGED", fromStatus: task.status, toStatus: newStatus, ...(newStatus === "DONE" && task.type === "TICKET" && opts.resolution ? { note: `Măsuri luate: ${opts.resolution.measures.trim().slice(0, 500)}${opts.resolution.minutes != null ? ` · Timp de rezolvare: ${opts.resolution.minutes} min` : ""}` } : {}) } })
+    .catch((e) => console.error(`[tasks] changeTaskStatus: jurnalizare TaskActivity eșuată pentru ${taskId}`, e));
+  console.log(`[tasks] changeTaskStatus: salvat în DB — ${task.status} → ${newStatus}`);
+  // cererea clientului din portal e rezolvată / închisă: clientul primește un email (doar pentru cererile create din portal)
+  if (task.type === "TICKET" && (newStatus === "DONE" || newStatus === "CANCELLED")) notifyClientTicketClosed(taskId, newStatus);
+
+  // Notificări best-effort (nu afectează rezultatul scrierii de mai sus)
+  try {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { name: true, teamIds: true } });
+    const actorName = actor?.name ?? "Cineva";
+
+    // Direcți: creatorul + asignatul. Administratorii: filtrați după echipă/membru/tip eveniment
+    // (notifyScope din Settings utilizator). Observatori: cei cu „Status task schimbat" bifat.
+    const eventKeys =
+      newStatus === "READ" ? ["task.status", "task.read"]
+      : newStatus === "DONE" ? ["task.status", "task.done"]
+      : ["task.status"];
+    const assignmentSettings: AssignmentSetting[] = task.assignmentSettingsJson
+      ? (JSON.parse(task.assignmentSettingsJson) as AssignmentSetting[])
+      : [];
+
+    // Collect all extra-assigned user IDs (direct + via extra teams)
+    const extraDirectIds = task.extraAssigneeIds ?? [];
+    const extraTeamMemberIds: string[] = [];
+    for (const tid of (task.extraTeamIds ?? [])) {
+      const t = await prisma.team.findUnique({ where: { id: tid }, select: { memberIds: true } });
+      t?.memberIds.forEach((id) => extraTeamMemberIds.push(id));
+    }
+
+    const admins = await filteredAdminRecipients({
+      eventKeys,
+      teamIds: [task.teamId, ...(task.extraTeamIds ?? []), ...(task.assignee?.teamIds ?? []), ...(actor?.teamIds ?? [])],
+      memberIds: [actorId, task.assigneeId, ...extraDirectIds],
+    });
+    const recipients = new Set<string>([
+      task.creatorId,
+      ...admins,
+      ...(await observerRecipients("task.status")),
+    ]);
+    if (task.assigneeId && shouldNotifyByThreshold(assignmentSettings, task.assigneeId, false, newStatus)) {
+      recipients.add(task.assigneeId);
+    }
+    for (const uid of extraDirectIds) {
+      if (shouldNotifyByThreshold(assignmentSettings, uid, false, newStatus)) recipients.add(uid);
+    }
+    if (task.teamId && shouldNotifyByThreshold(assignmentSettings, task.teamId, true, newStatus)) {
+      const t = await prisma.team.findUnique({ where: { id: task.teamId }, select: { memberIds: true } });
+      t?.memberIds.forEach((id) => recipients.add(id));
+    }
+    for (const uid of extraTeamMemberIds) recipients.add(uid);
+    recipients.delete(actorId);
+    const recipientIds = [...recipients];
+    console.log(`[tasks] changeTaskStatus: ${recipientIds.length} destinatari de notificat`, recipientIds);
+
+    // In-app + push (Telegram trimis separat mai jos, cu format dedicat)
+    await notifyUsers(
+      recipientIds,
+      {
+        title: `${taskLabel(task.seq, task.title)} → ${TASK_STATUS_RO[newStatus]}`,
+        body: `de ${actorName}`,
+        taskId: task.id,
+        seq: task.seq,
+        url: `/tasks/${task.id}`,
+      },
+      { telegram: false },
+    );
+    await notifyTaskUpdateTelegram(recipientIds, {
+      actorName,
+      taskTitle: task.title,
+      statusLabel: TASK_STATUS_RO[newStatus],
+      taskId: task.id,
+      seq: task.seq,
+    });
+
+    if (opts.fromTelegram && task.telegramChatId && task.telegramMessageId) {
+      const editLines = [
+        `📋 <b>${TASK_TYPE_RO[task.type]}</b> (${taskRef(task.seq, task.id)})`,
+        `<b>${escapeHtml(task.title)}</b>`,
+      ];
+      if (!closed && task.description?.trim()) {
+        editLines.push("", escapeHtml(task.description.trim()));
+      }
+      editLines.push("", `Status: <b>${TASK_STATUS_RO[newStatus]}</b>`);
+      const tp = task.project as { lat: number | null; lng: number | null; address: string | null } | null;
+      if (tp?.lat != null && tp?.lng != null) {
+        editLines.push(`​<a href="https://maps.google.com/maps?q=${tp.lat},${tp.lng}">​</a>`);
+      } else if (tp?.address) {
+        editLines.push(`​<a href="https://maps.google.com/maps?q=${encodeURIComponent(tp.address)}">​</a>`);
+      }
+      await editMessageText(
+        task.telegramChatId,
+        task.telegramMessageId,
+        editLines.join("\n"),
+        taskStatusButtons(task.id),
+      );
+    }
+  } catch (e) {
+    console.error(`[tasks] changeTaskStatus: pipeline-ul de notificare a eșuat pentru task ${taskId}`, e);
+  }
+
+  return { ok: true as const, changed: true, fromStatus: task.status, title: task.title, type: task.type, hadTelegramMessage: !!(task.telegramChatId && task.telegramMessageId) };
+}
+
+/** Schimbă progresul (0-100) + jurnal + notificare admin/creator (best-effort, logat). */
+export async function changeTaskProgress(taskId: string, actorId: string, progress: number, opts: { fromTelegram?: boolean } = {}) {
+  console.log(`[tasks] changeTaskProgress: task=${taskId} actor=${actorId} -> ${progress}%`);
+  if (DEMO) return { ok: false as const, error: "Mod demo." };
+  const p = Math.max(0, Math.min(100, Math.round(progress)));
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: {
+      id: true,
+      seq: true,
+      title: true,
+      type: true,
+      progress: true,
+      creatorId: true,
+      assigneeId: true,
+      teamId: true,
+      extraAssigneeIds: true,
+      extraTeamIds: true,
+      assignee: { select: { teamIds: true } },
+    },
+  });
+  if (!task) {
+    console.error(`[tasks] changeTaskProgress: task ${taskId} nu există`);
+    return { ok: false as const, error: "Sarcină inexistentă." };
+  }
+  if (!(await actorMayWorkOnTask(actorId, task))) {
+    return { ok: false as const, error: opts.fromTelegram ? "Nu ai acces la această sarcină." : "Nu ai permisiunea de editare." };
+  }
+  if (task.progress === p) {
+    console.log(`[tasks] changeTaskProgress: deja ${p}%, nimic de făcut`);
+    return { ok: true as const, changed: false, fromProgress: task.progress, title: task.title, type: task.type };
+  }
+
+  await prisma.task.update({ where: { id: taskId }, data: { progress: p } });
+  console.log(`[tasks] changeTaskProgress: salvat în DB — ${task.progress}% → ${p}%`);
+
+  try {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { name: true, teamIds: true } });
+    const actorName = actor?.name ?? "Cineva";
+
+    const admins = await filteredAdminRecipients({
+      eventKeys: ["task.progress"],
+      teamIds: [task.teamId, ...(task.assignee?.teamIds ?? []), ...(actor?.teamIds ?? [])],
+      memberIds: [actorId, task.assigneeId],
+    });
+    const recipients = new Set<string>([
+      task.creatorId,
+      ...admins,
+      ...(await observerRecipients("task.progress")),
+    ]);
+    if (task.assigneeId) recipients.add(task.assigneeId);
+    recipients.delete(actorId);
+    const recipientIds = [...recipients];
+    console.log(`[tasks] changeTaskProgress: ${recipientIds.length} destinatari de notificat`, recipientIds);
+
+    await notifyUsers(
+      recipientIds,
+      {
+        title: `${taskLabel(task.seq, task.title)} · ${p}%`,
+        body: `de ${actorName}`,
+        taskId: task.id,
+        seq: task.seq,
+        url: `/tasks/${task.id}`,
+      },
+      { telegram: false },
+    );
+    await notifyTaskUpdateTelegram(recipientIds, {
+      actorName,
+      taskTitle: task.title,
+      statusLabel: `Progres ${p}%`,
+      taskId: task.id,
+      seq: task.seq,
+    });
+  } catch (e) {
+    console.error(`[tasks] changeTaskProgress: pipeline-ul de notificare a eșuat pentru task ${taskId}`, e);
+  }
+  return { ok: true as const, changed: true, fromProgress: task.progress, title: task.title, type: task.type };
+}
+
+/** Adaugă un comentariu pe task + notificare (web sau Telegram, best-effort, logat). */
+export async function addTaskComment(
+  taskId: string,
+  actorId: string,
+  body: string,
+  source: CreatedFrom = "WEB",
+) {
+  console.log(`[tasks] addTaskComment: task=${taskId} actor=${actorId} source=${source}`);
+  if (DEMO) return { ok: false as const, error: "Mod demo." };
+  const text = body.trim();
+  if (!text) return { ok: false as const, error: "Comentariul e gol." };
+
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: {
+      id: true,
+      seq: true,
+      title: true,
+      creatorId: true,
+      assigneeId: true,
+      teamId: true,
+      extraAssigneeIds: true,
+      extraTeamIds: true,
+      assignee: { select: { teamIds: true } },
+    },
+  });
+  if (!task) {
+    console.error(`[tasks] addTaskComment: task ${taskId} nu există`);
+    return { ok: false as const, error: "Sarcină inexistentă." };
+  }
+  // Din Telegram nu există alt control de acces: verificăm aici (la fel ca la schimbarea statusului).
+  if (source === "TELEGRAM" && !(await actorHasTaskAccess(actorId, task))) {
+    return { ok: false as const, error: "Nu ai acces la această sarcină." };
+  }
+
+  const comment = await prisma.taskComment.create({
+    data: { taskId, userId: actorId, body: text, source },
+    select: { id: true, createdAt: true },
+  });
+  console.log(`[tasks] addTaskComment: salvat comentariu ${comment.id} pe task ${taskId}`);
+  await prisma.taskActivity
+    .create({ data: { taskId, userId: actorId, action: "COMMENTED", meta: { body: text.length > 200 ? `${text.slice(0, 200)}…` : text } } })
+    .catch(() => {});
+
+  try {
+    const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { name: true, teamIds: true } });
+    const actorName = actor?.name ?? "Cineva";
+
+    const admins = await filteredAdminRecipients({
+      eventKeys: ["task.comment"],
+      teamIds: [task.teamId, ...(task.assignee?.teamIds ?? []), ...(actor?.teamIds ?? [])],
+      memberIds: [actorId, task.assigneeId],
+    });
+    const recipients = new Set<string>([
+      task.creatorId,
+      ...admins,
+      ...(await observerRecipients("task.comment")),
+    ]);
+    if (task.assigneeId) recipients.add(task.assigneeId);
+    recipients.delete(actorId);
+    const recipientIds = [...recipients];
+    console.log(`[tasks] addTaskComment: ${recipientIds.length} destinatari de notificat`);
+
+    const preview = text.length > 100 ? `${text.slice(0, 100)}…` : text;
+    await notifyUsers(
+      recipientIds,
+      {
+        title: taskLabel(task.seq, task.title),
+        body: `${actorName}: ${preview}`,
+        taskId: task.id,
+        seq: task.seq,
+        url: `/tasks/${task.id}`,
+      },
+      { telegram: false },
+    );
+    await notifyTaskUpdateTelegram(recipientIds, {
+      actorName,
+      taskTitle: task.title,
+      statusLabel: preview,
+      taskId: task.id,
+      seq: task.seq,
+      lineLabel: "Comentariu",
+    });
+  } catch (e) {
+    console.error(`[tasks] addTaskComment: pipeline de notificare eșuat pentru task ${taskId}`, e);
+  }
+
+  return { ok: true as const, id: comment.id };
+}
+
+/** Comentariile unui task, în ordine cronologică. */
+export async function listTaskComments(taskId: string) {
+  if (DEMO) return [];
+  return prisma.taskComment.findMany({
+    where: { taskId },
+    select: { id: true, body: true, source: true, createdAt: true, user: { select: { name: true } } },
+    orderBy: { createdAt: "asc" },
+  });
+}
+
+/**
+ * Verifică task-urile cu termen trecut, nefinalizate, și trimite notificarea de
+ * întârziere o singură dată (overdueNotifiedAt). Apelată periodic (cron).
+ */
+export async function checkOverdueTasks(): Promise<{ checked: number; notified: number }> {
+  if (DEMO) return { checked: 0, notified: 0 };
+  const now = new Date();
+
+  const { loadStatusConfigs } = await import("../queries/ticket-status-config");
+  const { getStatusConfig } = await import("../ticket-status-config");
+  const statusCfgs = await loadStatusConfigs();
+
+  // Filtrăm în JS pentru că MongoDB nu potrivește câmpuri absente cu { equals: null }
+  const candidates = await prisma.task.findMany({
+    where: {
+      dueAt: { lt: now },
+      status: { notIn: ["DONE", "CANCELLED"] },
+    },
+    select: {
+      id: true, seq: true, title: true, status: true, dueAt: true,
+      creatorId: true, assigneeId: true, teamId: true,
+      overdueNotifiedAt: true,
+      assignee: { select: { teamIds: true } },
+    },
+  });
+  const tasks = candidates.filter((t) => {
+    // `dueAt: { lt: now }` potrivește și task-urile FĂRĂ termen (null) pe MongoDB — le excludem explicit,
+    // altfel orice task creat fără deadline e raportat „în întârziere" la prima rulare a cron-ului.
+    if (!t.dueAt || t.dueAt >= now) return false;
+    if (t.overdueNotifiedAt) return false;
+    // Nu trimite dacă statusul curent are suppressAll activ
+    const cfg = getStatusConfig(statusCfgs, t.status);
+    if (cfg?.suppressAll) return false;
+    return true;
+  });
+  console.log(`[tasks] checkOverdueTasks: ${candidates.length} cu termen trecut, ${tasks.length} nenotificate`);
+
+  let notified = 0;
+  for (const task of tasks) {
+    try {
+      // Marcăm ÎNAINTE de trimitere — previne trimiteri duble dacă cron-ul rulează în paralel
+      await prisma.task.update({ where: { id: task.id }, data: { overdueNotifiedAt: now } });
+
+      const admins = await filteredAdminRecipients({
+        eventKeys: ["task.overdue"],
+        teamIds: [task.teamId, ...(task.assignee?.teamIds ?? [])],
+        memberIds: [task.assigneeId, task.creatorId],
+      });
+      const recipients = new Set<string>([
+        task.creatorId,
+        ...admins,
+        ...(await observerRecipients("task.overdue")),
+      ]);
+      if (task.assigneeId) recipients.add(task.assigneeId);
+      const recipientIds = [...recipients];
+
+      await notifyUsers(
+        recipientIds,
+        {
+          title: `⏰ ${taskLabel(task.seq, task.title)} – Întârziat`,
+          taskId: task.id,
+          seq: task.seq,
+          url: `/tasks/${task.id}`,
+        },
+        { telegram: false },
+      );
+      await notifyTaskOverdueTelegram(recipientIds, task.title, task.id, task.seq);
+      notified++;
+    } catch (e) {
+      console.error(`[tasks] checkOverdueTasks: eșuat pentru task ${task.id}`, e);
+    }
+  }
+  console.log(`[tasks] checkOverdueTasks: ${notified}/${tasks.length} notificate`);
+  return { checked: tasks.length, notified };
+}
+
+export type UpdateTaskInput = {
+  title?: string;
+  description?: string;
+  assigneeId?: string | null;
+  teamId?: string | null;
+  extraAssigneeIds?: string[];
+  extraTeamIds?: string[];
+  assignmentSettingsJson?: string | null;
+  projectId?: string | null;
+  clientId?: string | null;
+  categoryId?: string | null;
+  address?: string | null;
+  /** Numele consumatorului pentru care s-a depus cererea. */
+  consumerName?: string | null;
+  /** Tipul serviciului (WATER / SEWER / BOTH), gol = nespecificat. */
+  serviceType?: string | null;
+  /** Categoria consumatorului (HOUSEHOLD / NON_HOUSEHOLD), gol = nespecificat. */
+  consumerType?: string | null;
+  /** Secția (Section); gol = fără secție. Dacă lipsește din editare dar s-a schimbat atribuirea, o task fără secție o primește din echipele / persoanele noi. */
+  sectionId?: string | null;
+  priority?: TaskPriority;
+  dueAt?: Date | null;
+  reminderIntervalMinutes?: number | null;
+  /** Reamintire programată (null = fără); când e dată, înlocuiește intervalul fix. */
+  reminderSchedule?: ReminderSchedule | null;
+  bypassQuietHours?: boolean;
+};
+
+const EDIT_PRIO_RO: Record<string, string> = { LOW: "Scăzută", MEDIUM: "Medie", HIGH: "Ridicată", URGENT: "Urgentă" };
+function fmtDueLog(d: Date | null | undefined): string | null {
+  if (!d) return null;
+  const dk = formatDate(d, DEFAULT_TZ);
+  const tk = formatTime(d, DEFAULT_TZ);
+  return tk === "00:00" ? dk : `${dk} ${tk}`;
+}
+
+/** Editează câmpurile unui task și loghează câmpurile modificate în TaskActivity. */
+export async function updateTask(taskId: string, actorId: string, input: UpdateTaskInput) {
+  if (DEMO) return { ok: false as const, error: "Mod demo." };
+  const task = await prisma.task.findUnique({
+    where: { id: taskId },
+    select: {
+      id: true, seq: true, title: true, type: true,
+      description: true, priority: true, dueAt: true,
+      assigneeId: true, teamId: true, projectId: true, address: true, consumerName: true, serviceType: true, consumerType: true, sectionId: true,
+      creatorId: true, extraAssigneeIds: true, extraTeamIds: true,
+      assignee: { select: { name: true, teamIds: true } },
+      team: { select: { name: true } },
+      project: { select: { name: true } },
+      category: { select: { name: true } },
+    },
+  });
+  if (!task) return { ok: false as const, error: "Sarcină inexistentă." };
+
+  const data: Record<string, unknown> = {};
+  if (input.title !== undefined) {
+    const t = input.title.trim();
+    if (!t) return { ok: false as const, error: "Titlul e obligatoriu." };
+    data.title = t;
+  }
+  if (input.description !== undefined) data.description = input.description.trim() || null;
+  if ("assigneeId" in input) data.assigneeId = input.assigneeId || null;
+  if ("teamId" in input) data.teamId = input.teamId || null;
+  if ("extraAssigneeIds" in input) data.extraAssigneeIds = input.extraAssigneeIds ?? [];
+  if ("extraTeamIds" in input) data.extraTeamIds = input.extraTeamIds ?? [];
+  if ("assignmentSettingsJson" in input) data.assignmentSettingsJson = input.assignmentSettingsJson ?? null;
+  if ("projectId" in input) {
+    const newProjectId = input.projectId || null;
+    data.projectId = newProjectId;
+    if (newProjectId) {
+      const proj = await prisma.project.findUnique({ where: { id: newProjectId }, select: { clientId: true } });
+      data.clientId = proj?.clientId ?? null;
+    } else {
+      data.clientId = input.clientId || null;
+    }
+  } else if ("clientId" in input) {
+    data.clientId = input.clientId || null;
+  }
+  if ("categoryId" in input) data.categoryId = input.categoryId || null;
+  if ("address" in input) data.address = input.address?.trim().slice(0, 300) || null;
+  if ("consumerName" in input) data.consumerName = input.consumerName?.replace(/\s+/g, " ").trim().slice(0, 150) || null;
+  if ("serviceType" in input) data.serviceType = parseServiceType(input.serviceType);
+  if ("consumerType" in input) data.consumerType = parseConsumerType(input.consumerType);
+  if ("sectionId" in input) data.sectionId = await existingSectionId(input.sectionId);
+  else if ("assigneeId" in input || "teamId" in input || "extraAssigneeIds" in input || "extraTeamIds" in input) {
+    // atribuire schimbată fără secție în cerere (ex. din tabel): secția se completează din noii responsabili, ca în formular; dacă atribuirea nu s-a schimbat de fapt, secția rămâne
+    const teamsAfter = [("teamId" in input ? input.teamId : task.teamId), ...("extraTeamIds" in input ? (input.extraTeamIds ?? []) : (task.extraTeamIds ?? []))].filter(Boolean) as string[];
+    const usersAfter = [("assigneeId" in input ? input.assigneeId : task.assigneeId), ...("extraAssigneeIds" in input ? (input.extraAssigneeIds ?? []) : (task.extraAssigneeIds ?? []))].filter(Boolean) as string[];
+    const key = (a: (string | null)[]) => [...a].filter(Boolean).sort().join("|");
+    const changed = key(teamsAfter) !== key([task.teamId, ...(task.extraTeamIds ?? [])]) || key(usersAfter) !== key([task.assigneeId, ...(task.extraAssigneeIds ?? [])]);
+    if (changed) {
+      const derived = await deriveTaskSectionId(teamsAfter, usersAfter);
+      if (derived && derived !== task.sectionId) data.sectionId = derived;
+    }
+  }
+  if (input.priority !== undefined) data.priority = input.priority;
+  if ("dueAt" in input) {
+    data.dueAt = input.dueAt ?? null;
+    // Termen nou: o eventuală notificare de întârziere trebuie să poată pleca din nou când noul termen trece.
+    if ((input.dueAt?.getTime() ?? null) !== (task.dueAt?.getTime() ?? null)) data.overdueNotifiedAt = null;
+  }
+  if ("reminderIntervalMinutes" in input || "reminderSchedule" in input) {
+    const schedule = input.reminderSchedule ?? null;
+    const intervalMin = schedule ? null : input.reminderIntervalMinutes || null;
+    data.reminderIntervalMinutes = intervalMin;
+    // fără programare: null (pe MongoDB, `Prisma.DbNull` e refuzat la câmpurile Json)
+    data.reminderSchedule = schedule ? (schedule as unknown as Prisma.InputJsonValue) : null;
+    data.nextReminderAt = schedule ? computeNextRun(schedule, new Date()) : intervalMin ? new Date(Date.now() + intervalMin * 60_000) : null;
+  }
+  if ("bypassQuietHours" in input) data.bypassQuietHours = input.bypassQuietHours ?? false;
+
+  // Cine răspundea de task înainte și cine răspunde după editare — cei ADĂUGAȚI trebuie anunțați că li s-a dat task-ul.
+  const nextAssign = {
+    assigneeId: "assigneeId" in input ? (input.assigneeId || null) : task.assigneeId,
+    extraAssigneeIds: "extraAssigneeIds" in input ? (input.extraAssigneeIds ?? []) : (task.extraAssigneeIds ?? []),
+    teamId: "teamId" in input ? (input.teamId || null) : task.teamId,
+    extraTeamIds: "extraTeamIds" in input ? (input.extraTeamIds ?? []) : (task.extraTeamIds ?? []),
+  };
+  let addedAssignees: string[] = [];
+  try {
+    const before = await assignedUserSet({ assigneeId: task.assigneeId, extraAssigneeIds: task.extraAssigneeIds ?? [], teamId: task.teamId, extraTeamIds: task.extraTeamIds ?? [] });
+    const after = await assignedUserSet(nextAssign);
+    addedAssignees = [...after].filter((id) => !before.has(id) && id !== actorId);
+  } catch (e) {
+    console.error("[tasks] updateTask: calculul responsabililor noi a eșuat", e);
+  }
+
+  await prisma.task.update({ where: { id: taskId }, data });
+
+  if (addedAssignees.length > 0) {
+    const actorRow = await prisma.user.findUnique({ where: { id: actorId }, select: { name: true } }).catch(() => null);
+    await notifyTaskAssigned(taskId, addedAssignees, actorRow?.name ?? "Cineva");
+  }
+
+  // Compute diff for audit trail (best-effort, non-blocking)
+  let auditChanges: { field: string; from: string | null; to: string | null }[] = [];
+  try {
+    type Change = { field: string; from: string | null; to: string | null };
+    const changes: Change[] = [];
+
+    const newTitle = input.title?.trim();
+    if (newTitle !== undefined && newTitle !== task.title) {
+      changes.push({ field: "Titlu", from: task.title, to: newTitle });
+    }
+
+    const newDesc = input.description !== undefined ? (input.description.trim() || null) : undefined;
+    if (newDesc !== undefined) {
+      const oldDesc = task.description?.trim() || null;
+      if (oldDesc !== newDesc) {
+        const trunc = (s: string | null) => s && s.length > 80 ? `${s.slice(0, 80)}…` : s;
+        changes.push({ field: "Descriere", from: trunc(oldDesc), to: trunc(newDesc) });
+      }
+    }
+
+    if (input.priority !== undefined && input.priority !== task.priority) {
+      changes.push({ field: "Prioritate", from: EDIT_PRIO_RO[task.priority], to: EDIT_PRIO_RO[input.priority] });
+    }
+
+    const newDue = "dueAt" in input ? (input.dueAt ?? null) : undefined;
+    if (newDue !== undefined) {
+      const oldDueStr = fmtDueLog(task.dueAt);
+      const newDueStr = fmtDueLog(newDue);
+      if (oldDueStr !== newDueStr) {
+        changes.push({ field: "Deadline", from: oldDueStr, to: newDueStr });
+      }
+    }
+
+    const newAssigneeId = "assigneeId" in input ? (input.assigneeId || null) : undefined;
+    if (newAssigneeId !== undefined && newAssigneeId !== task.assigneeId) {
+      const newAssigneeName = newAssigneeId
+        ? (await prisma.user.findUnique({ where: { id: newAssigneeId }, select: { name: true } }))?.name ?? null
+        : null;
+      changes.push({ field: "Asignat", from: task.assignee?.name ?? null, to: newAssigneeName });
+    }
+
+    const newTeamId = "teamId" in input ? (input.teamId || null) : undefined;
+    if (newTeamId !== undefined && newTeamId !== task.teamId) {
+      const newTeamName = newTeamId
+        ? (await prisma.team.findUnique({ where: { id: newTeamId }, select: { name: true } }))?.name ?? null
+        : null;
+      changes.push({ field: "Echipă", from: task.team?.name ?? null, to: newTeamName });
+    }
+
+    const newProjectId = "projectId" in input ? (input.projectId || null) : undefined;
+    if (newProjectId !== undefined && newProjectId !== task.projectId) {
+      const newProjectName = newProjectId
+        ? (await prisma.project.findUnique({ where: { id: newProjectId }, select: { name: true } }))?.name ?? null
+        : null;
+      changes.push({ field: "Proiect", from: task.project?.name ?? null, to: newProjectName });
+    }
+
+    if ("address" in input) {
+      const na = input.address?.trim().slice(0, 300) || null;
+      if (na !== (task.address ?? null)) changes.push({ field: "Adresă", from: task.address ?? null, to: na });
+    }
+    if ("consumerName" in input) {
+      const nn = input.consumerName?.replace(/\s+/g, " ").trim().slice(0, 150) || null;
+      if (nn !== (task.consumerName ?? null)) changes.push({ field: "Nume consumator", from: task.consumerName ?? null, to: nn });
+    }
+    if ("serviceType" in input) {
+      const ns = parseServiceType(input.serviceType);
+      const lbl = (v: string | null | undefined) => { const k = parseServiceType(v); return k ? SERVICE_TYPE_LABEL[k] : null; };
+      if (ns !== parseServiceType(task.serviceType)) changes.push({ field: "Tip serviciu", from: lbl(task.serviceType), to: lbl(ns) });
+    }
+    if ("consumerType" in input) {
+      const nk = parseConsumerType(input.consumerType);
+      const lbl = (v: string | null | undefined) => { const k = parseConsumerType(v); return k ? CONSUMER_TYPE_LABEL[k] : null; };
+      if (nk !== parseConsumerType(task.consumerType)) changes.push({ field: "Tip consumator", from: lbl(task.consumerType), to: lbl(nk) });
+    }
+    if ("categoryId" in input) {
+      const nc = input.categoryId || null;
+      const oldCat = task.category?.name ?? null;
+      const newCat = nc ? ((await prisma.category.findUnique({ where: { id: nc }, select: { name: true } }))?.name ?? null) : null;
+      if (newCat !== oldCat) changes.push({ field: "Categorie", from: oldCat, to: newCat });
+    }
+    auditChanges = changes;
+
+    if (changes.length > 0) {
+      await prisma.taskActivity
+        .create({ data: { taskId, userId: actorId, action: "EDITED", meta: { changes } } })
+        .catch(() => {});
+
+      // Notificare Telegram — trimisă asignaților/creatorului + observatori admini (best-effort)
+      try {
+        const actor = await prisma.user.findUnique({ where: { id: actorId }, select: { name: true, teamIds: true } });
+        const actorName = actor?.name ?? "Cineva";
+
+        const directRecipients = new Set<string>([task.creatorId]);
+        if (task.assigneeId) directRecipients.add(task.assigneeId);
+        for (const uid of task.extraAssigneeIds ?? []) directRecipients.add(uid);
+        if (task.teamId) {
+          const t = await prisma.team.findUnique({ where: { id: task.teamId }, select: { memberIds: true } });
+          t?.memberIds.forEach((id) => directRecipients.add(id));
+        }
+        for (const tid of task.extraTeamIds ?? []) {
+          const t = await prisma.team.findUnique({ where: { id: tid }, select: { memberIds: true } });
+          t?.memberIds.forEach((id) => directRecipients.add(id));
+        }
+        directRecipients.delete(actorId);
+
+        // Admini observatori (filtrați după scope/event task.edit)
+        const adminIds = await filteredAdminRecipients({
+          eventKeys: ["task.edit"],
+          teamIds: [task.teamId, ...(task.extraTeamIds ?? []), ...(task.assignee?.teamIds ?? []), ...(actor?.teamIds ?? [])],
+          memberIds: [actorId, task.assigneeId, ...task.extraAssigneeIds ?? []],
+        });
+        const observerAdminIds = await observerRecipients("task.edit");
+        const allRecipients = new Set<string>([...directRecipients, ...adminIds, ...observerAdminIds]);
+        allRecipients.delete(actorId);
+        for (const id of addedAssignees) allRecipients.delete(id); // au primit deja cardul „asignat ție”
+
+        if (allRecipients.size > 0) {
+          // Valorile vin din titluri/descrieri/nume (pot conține &, <, >): fără escape, Telegram refuză tot mesajul.
+          const changeLines = (changes as { field: string; from: string | null; to: string | null }[])
+            .map((c) => `• ${escapeHtml(c.field)}: ${escapeHtml(c.from ?? "—")} → ${escapeHtml(c.to ?? "—")}`)
+            .join("\n");
+          const text = [
+            "✏️ <b>Sarcină modificată</b>",
+            "",
+            `Lucrător: ${escapeHtml(actorName)}`,
+            `Sarcină: ${escapeHtml(task.title)} (${taskRef(task.seq, taskId)})`,
+            "Modificări:",
+            changeLines,
+            `Ora: ${formatTime(new Date(), DEFAULT_TZ)}`,
+          ].join("\n");
+
+          await Promise.all([...allRecipients].map(async (uid) => {
+            try {
+              const chatId = await telegramChatFor(uid);
+              if (!chatId) return;
+              await sendMessage(chatId, text, taskOpenButton(task.seq, taskId));
+            } catch { /* best-effort */ }
+          }));
+
+          // In-app + push pentru toți
+          await notifyUsers(
+            [...allRecipients],
+            {
+              title: `${TASK_TYPE_RO[task.type]} modificat: ${taskLabel(task.seq, task.title)}`,
+              body: `de ${actorName}`,
+              taskId,
+              seq: task.seq,
+              url: `/tasks/${taskId}`,
+            },
+            { telegram: false },
+          );
+        }
+      } catch { /* non-blocking */ }
+    }
+  } catch {
+    // non-blocking
+  }
+
+  return { ok: true as const, title: (input.title?.trim() ?? task.title), type: task.type, changes: auditChanges };
+}
+
+/**
+ * Trimite reamintiri periodice pentru task-urile active cu `reminderIntervalMinutes` configurat.
+ * Se apelează din cron-job; best-effort, nu aruncă excepție.
+ */
+export async function checkTaskReminders(): Promise<{ checked: number; notified: number }> {
+  if (DEMO) return { checked: 0, notified: 0 };
+  const now = new Date();
+
+  const candidates = await prisma.task.findMany({
+    // `not: null` e necesar: filtrul `lte` al lui Prisma pe MongoDB potrivește și documentele cu nextReminderAt = null (o programare „o singură dată” deja trimisă ar pleca la nesfârșit)
+    where: { status: { notIn: ["DONE", "CANCELLED"] }, AND: [{ nextReminderAt: { not: null } }, { nextReminderAt: { lte: now } }] },
+    select: {
+      id: true, seq: true, title: true, description: true,
+      type: true, status: true, priority: true,
+      dueAt: true, reminderIntervalMinutes: true, reminderSchedule: true, nextReminderAt: true,
+      creatorId: true, assigneeId: true, teamId: true,
+      reminderMsgChatId: true, reminderMsgId: true,
+      assignee: { select: { name: true, teamIds: true } },
+      project: { select: { name: true, lat: true, lng: true, address: true } },
+    },
+  });
+  // Cron-ul rulează des (la 1–5 minute): cea mai mare parte a rulărilor nu au nimic scadent — ies aici, fără alte interogări.
+  if (candidates.length === 0) return { checked: 0, notified: 0 };
+
+  const { loadStatusConfigs } = await import("../queries/ticket-status-config");
+  const { getStatusConfig } = await import("../ticket-status-config");
+  const statusCfgs = await loadStatusConfigs();
+  const tasks = candidates.filter((t) => {
+    if (!t.nextReminderAt) return false;
+    if (!t.reminderIntervalMinutes && !parseReminderSchedule(t.reminderSchedule)) return false;
+    const cfg = getStatusConfig(statusCfgs, t.status);
+    if (cfg?.suppressAll) return false;
+    return true;
+  });
+
+  console.log(`[tasks] checkTaskReminders: ${tasks.length}/${candidates.length} task-uri cu reamintire scadentă`);
+
+  let notified = 0;
+  for (const task of tasks) {
+    try {
+      // Actualizăm nextReminderAt ÎNAINTE de trimitere — previne duble la rulare paralelă
+      // Programată: următoarea potrivită din programare (null după o reamintire „o singură dată” sau după „până la”); altfel intervalul fix.
+      const schedule = parseReminderSchedule(task.reminderSchedule);
+      const nextAt = schedule ? computeNextRun(schedule, now) : new Date(now.getTime() + task.reminderIntervalMinutes! * 60_000);
+      // „Revendicare” atomică: doar cine reușește să mute nextReminderAt (încă egal cu valoarea citită) trimite — altfel altă rulare (cron / temporizator) a trimis deja.
+      const claimed = await prisma.task.updateMany({ where: { id: task.id, nextReminderAt: task.nextReminderAt }, data: { nextReminderAt: nextAt } });
+      if (claimed.count === 0) continue;
+
+      const isOverdue = task.dueAt && task.dueAt < now;
+
+      // ── Destinatari ──────────────────────────────────────────────────────────
+      const admins = await filteredAdminRecipients({
+        eventKeys: ["task.reminder"],
+        teamIds: [task.teamId, ...(task.assignee?.teamIds ?? [])],
+        memberIds: [task.assigneeId, task.creatorId],
+      });
+      const allRecipients = new Set<string>([task.creatorId, ...admins, ...(await observerRecipients("task.reminder"))]);
+      if (task.assigneeId) allRecipients.add(task.assigneeId);
+      const recipientIds = [...allRecipients];
+
+      // ── Telegram detaliat pentru asignat ─────────────────────────────────────
+      let newReminderChatId: string | null = null;
+      let newReminderMsgId: number | null = null;
+
+      if (task.assigneeId) {
+        const chatId = await telegramChatFor(task.assigneeId);
+        if (chatId) {
+          // Șterge reamintirea anterioară (best-effort)
+          if (task.reminderMsgChatId && task.reminderMsgId) {
+            await deleteMessage(task.reminderMsgChatId, task.reminderMsgId).catch(() => {});
+          }
+
+          // Construiește mesaj detaliat (același format ca notifyNewTask)
+          const header = isOverdue
+            ? `⏰ <b>Sarcină în întârziere</b> (${taskRef(task.seq, task.id)})`
+            : `🔔 <b>Reamintire ${TASK_TYPE_RO[task.type]}</b> (${taskRef(task.seq, task.id)})`;
+
+          const lines = [
+            header,
+            `<b>${escapeHtml(task.title)}</b>`,
+          ];
+          if (task.description?.trim()) {
+            lines.push("", escapeHtml(task.description.trim()));
+          }
+          lines.push(
+            "",
+            `⚑ Prioritate: <b>${TASK_PRIORITY_RO[task.priority]}</b>`,
+            `📌 Status: <b>${TASK_STATUS_RO[task.status]}</b>`,
+          );
+          if (task.assignee?.name) lines.push(`👤 Asignat: ${escapeHtml(task.assignee.name)}`);
+          if (task.project?.name) lines.push(`📁 Proiect: ${escapeHtml(task.project.name)}`);
+          if (task.dueAt) {
+            const deadlineLabel = isOverdue ? "⚠️ Deadline depășit" : "📅 Deadline";
+            lines.push(`${deadlineLabel}: <b>${formatDate(task.dueAt, DEFAULT_TZ)}</b>`);
+          }
+          const proj = task.project as { name: string; lat: number | null; lng: number | null; address: string | null } | null;
+          if (proj?.lat != null && proj?.lng != null) {
+            lines.push(
+              `📍 <a href="https://www.google.com/maps?q=${proj.lat},${proj.lng}">Google Maps</a>` +
+              ` | <a href="https://waze.com/ul?ll=${proj.lat},${proj.lng}&navigate=yes">Waze</a>` +
+              ` | <a href="https://maps.apple.com/?ll=${proj.lat},${proj.lng}">Apple Maps</a>`,
+            );
+          } else if (proj?.address) {
+            lines.push(`📍 <a href="https://www.google.com/maps?q=${encodeURIComponent(proj.address)}">Google Maps</a>`);
+          }
+
+          const text = lines.join("\n");
+          const res = (await sendMessage(chatId, text, taskStatusButtons(task.id))) as { message_id?: number } | null;
+          if (res?.message_id) {
+            newReminderChatId = chatId;
+            newReminderMsgId = res.message_id;
+          }
+        }
+      }
+
+      // ── In-app + PWA + Telegram pentru ceilalți destinatari ──────────────────
+      const lbl = taskLabel(task.seq, task.title);
+      const notifTitle = isOverdue ? `⏰ Întârziat: ${lbl}` : `🔔 Reamintire: ${lbl}`;
+      const notifBody = task.dueAt ? `Deadline: ${formatDate(task.dueAt, DEFAULT_TZ)}` : undefined;
+
+      // Asignatul primește Telegram detaliat mai sus; ceilalți primesc notificare standard
+      const othersIds = recipientIds.filter((id) => id !== task.assigneeId);
+      if (othersIds.length > 0) {
+        await notifyUsers(
+          othersIds,
+          { title: notifTitle, body: notifBody, taskId: task.id, seq: task.seq, url: `/tasks/${task.id}` },
+          { telegram: true },
+        );
+      }
+      // In-app + PWA pentru asignat (Telegram a fost trimis deja mai sus)
+      if (task.assigneeId) {
+        await notifyUsers(
+          [task.assigneeId],
+          { title: notifTitle, body: notifBody, taskId: task.id, seq: task.seq, url: `/tasks/${task.id}` },
+          { telegram: false },
+        );
+      }
+
+      // ── Email (best-effort) ───────────────────────────────────────────────────
+      if (env.smtp.enabled) {
+        const { sendTaskReminderEmail } = await import("../email");
+        await Promise.all(
+          recipientIds.map(async (uid) => {
+            try {
+              const u = await prisma.user.findUnique({ where: { id: uid }, select: { email: true, name: true } });
+              if (u?.email) {
+                await sendTaskReminderEmail({ to: u.email, userName: u.name, taskTitle: task.title, seq: task.seq, taskUrl: taskUrl(task.id), isOverdue: !!isOverdue });
+              }
+            } catch { /* best-effort */ }
+          }),
+        );
+      }
+
+      // ── Salvează ID mesaj Telegram (nextReminderAt a fost setat la start) ────────
+      if (newReminderChatId || newReminderMsgId) {
+        await prisma.task.update({
+          where: { id: task.id },
+          data: {
+            reminderMsgChatId: newReminderChatId,
+            reminderMsgId: newReminderMsgId,
+          },
+        });
+      }
+      notified++;
+    } catch (e) {
+      console.error(`[tasks] checkTaskReminders: eșuat pentru task ${task.id}`, e);
+    }
+  }
+
+  console.log(`[tasks] checkTaskReminders: ${notified}/${tasks.length} notificate`);
+  return { checked: tasks.length, notified };
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Trimite un atașament (imagine sau fișier) pe Telegram către toți
+ * destinatarii task-ului (asignat + echipă + extra).
+ */
+export async function notifyAttachmentTelegram(
+  taskId: string,
+  attUrl: string,
+  attName: string,
+  mimeType: string | null,
+): Promise<void> {
+  try {
+    const task = await prisma.task.findUnique({
+      where: { id: taskId },
+      select: {
+        seq: true, title: true, type: true,
+        assigneeId: true, teamId: true,
+        extraAssigneeIds: true, extraTeamIds: true,
+      },
+    });
+    if (!task) return;
+
+    // Colectează destinatarii
+    const recipients = new Set<string>();
+    if (task.assigneeId) recipients.add(task.assigneeId);
+    if (task.teamId) {
+      const team = await prisma.team.findUnique({ where: { id: task.teamId }, select: { memberIds: true } });
+      team?.memberIds.forEach((id) => recipients.add(id));
+    }
+    for (const uid of (task.extraAssigneeIds ?? [])) recipients.add(uid);
+    for (const tid of (task.extraTeamIds ?? [])) {
+      const team = await prisma.team.findUnique({ where: { id: tid }, select: { memberIds: true } });
+      team?.memberIds.forEach((id) => recipients.add(id));
+    }
+    if (!recipients.size) return;
+
+    const typeLabel = TASK_TYPE_RO[task.type] ?? "Sarcină";
+    const ref = task.seq != null ? `#${task.seq}` : taskId.slice(-6);
+    const caption = `📎 <b>${escapeHtml(attName)}</b>\n${typeLabel} ${ref}: ${escapeHtml(task.title)}`;
+    const keyboard = taskOpenButton(task.seq, taskId);
+    const isImage = mimeType?.startsWith("image/") && !mimeType.includes("svg");
+
+    for (const uid of recipients) {
+      try {
+        const chatId = await telegramChatFor(uid);
+        if (!chatId) continue;
+        if (isImage) {
+          await sendPhoto(chatId, absoluteUrl(attUrl), caption, keyboard);
+        } else {
+          await sendDocument(chatId, absoluteUrl(attUrl), caption, keyboard);
+        }
+      } catch {
+        // ignoră eșecul per-destinatar
+      }
+    }
+  } catch (e) {
+    console.error("[tasks] notifyAttachmentTelegram eșuat:", e);
+  }
+}

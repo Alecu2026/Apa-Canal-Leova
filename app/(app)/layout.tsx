@@ -1,0 +1,82 @@
+import { requireUser, isSuper } from "@/lib/dal";
+import { can } from "@/lib/permissions";
+import { DEMO } from "@/lib/demo";
+import { unreadCount } from "@/lib/queries/notifications";
+import { getCompanySettings } from "@/lib/queries/company";
+import AppShell from "@/app/components/AppShell";
+import PWARegister from "@/app/components/PWARegister";
+import { TableLookProvider } from "@/app/components/TableLookContext";
+import { sanitizePreset } from "@/lib/table-look";
+import OpenInApp from "@/app/components/OpenInApp";
+import CacheScope from "@/app/components/CacheScope";
+import PayersPrefetch from "@/app/components/PayersPrefetch";
+import { getLocaleFromCookie } from "@/lib/i18n/locale-cookie";
+import { getMessages } from "@/lib/i18n";
+
+export const dynamic = "force-dynamic";
+
+export default async function AppLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  const user = await requireUser();
+  const [unread, company, locale] = await Promise.all([
+    unreadCount(user.id),
+    getCompanySettings(),
+    getLocaleFromCookie(),
+  ]);
+  const messages = getMessages(locale);
+
+  const perms: Record<string, boolean> = {
+    "tasks.view": can(user, "tasks.view"),
+    "projects.view": can(user, "projects.view"),
+    "teams.view": can(user, "teams.view"),
+    "invoices.view": can(user, "invoices.view"),
+    "clients.view": can(user, "clients.view"),
+    "clients.edit": can(user, "clients.edit"),
+    "clients.create": can(user, "clients.create"),
+    "tasks.create": can(user, "tasks.create"),
+    "projects.create": can(user, "projects.create"),
+    "appointments.manage": can(user, "appointments.manage"),
+    "dashboard.view": can(user, "dashboard.view"),
+    "tickets.view": can(user, "tickets.view"),
+    "kanban.view": can(user, "kanban.view"),
+    "calendar.view": can(user, "calendar.view"),
+    "map.view": can(user, "map.view"),
+    "payers.view": can(user, "payers.view"),
+    // „Nereguli contoare”: cine are „Plătitori – Vizualizare” sau face parte dintr-o secție (vede neregulile secției lui)
+    "meterIssues.view": can(user, "payers.view") || can(user, "meters.issues") || can(user, "meters.manage") || (user.teamIds?.length ?? 0) > 0,
+    "meters.read": can(user, "meters.read"),
+    "meters.manage": can(user, "meters.manage"),
+    "pbx.view": can(user, "pbx.view"),
+    "pbx.manage": can(user, "pbx.manage"),
+    "appointments.view": can(user, "appointments.view"),
+    "users.manage": can(user, "users.manage"),
+    "users.impersonate": can(user, "users.impersonate") && !user.impersonation,
+    "audit.view": isSuper(user),
+  };
+
+  return (
+    <TableLookProvider preset={sanitizePreset(user.tableLook)} canCustomize={can(user, "tables.customize")}>
+    <CacheScope uid={user.id} />
+    <AppShell
+      userName={user.name}
+      demo={DEMO}
+      perms={perms}
+      unread={unread}
+      appointmentsLabel={company.appointmentsLabel}
+      bottomNav={user.bottomNav ?? []}
+      messages={messages}
+      locale={locale}
+      // eslint-disable-next-line react-hooks/purity -- momentul curent afișat la randare (valoare de afișare, nu stare)
+      impersonation={user.impersonation ? { who: user.name, by: user.impersonation.byName, expiresAt: user.impersonation.expiresAt, serverNow: Date.now() } : undefined}
+    >
+      {children}
+      <PWARegister unread={unread} />
+      <OpenInApp />
+      {(perms["payers.view"] || perms["invoices.view"]) && <PayersPrefetch payers={perms["payers.view"]} invoices={perms["invoices.view"]} />}
+    </AppShell>
+    </TableLookProvider>
+  );
+}

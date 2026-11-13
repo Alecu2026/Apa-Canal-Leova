@@ -1,0 +1,44 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["fra1"],
+  "functions": {
+    "app/api/invoice/public/[token]/pdf/route.ts": {
+      "memory": 1769,
+      "maxDuration": 60
+    },
+    "app/api/integrations/apa-canal/sync/route.ts": {
+      "memory": 1769,
+      "maxDuration": 300
+    },
+    "app/api/import/apa-canal-json/route.ts": {
+      "memory": 1769,
+      "maxDuration": 300
+    },
+    "app/api/cron/apa-canal-sync/route.ts": {
+      "memory": 1769,
+      "maxDuration": 300
+    },
+    "app/api/cron/lorawan/route.ts": {
+      "memory": 1769,
+      "maxDuration": 300
+    },
+    "app/api/platitori/tabel/export/route.ts": {
+      "memory": 1769,
+      "maxDuration": 300
+    }
+  },
+  "crons": [
+    { "path": "/api/cron",          "schedule": "0 6 * * *" },
+    { "path": "/api/cron/reminders","schedule": "0 7 * * *" },
+    { "path": "/api/cron/imap",     "schedule": "0 8 * * *" },
+    { "path": "/api/cron/imap",     "schedule": "0 10 * * *" },
+    { "path": "/api/cron/imap",     "schedule": "0 12 * * *" },
+    { "path": "/api/cron/imap",     "schedule": "0 14 * * *" },
+    { "path": "/api/cron/imap",     "schedule": "0 16 * * *" },
+    { "path": "/api/cron/imap",     "schedule": "0 18 * * *" },
+    { "path": "/api/cron/imap",     "schedule": "0 20 * * *" },
+    { "path": "/api/cron/apa-canal-sync", "schedule": "0 1 * * *" },
+    { "path": "/api/cron/lorawan?daily=1", "schedule": "30 20 * * *" },
+    { "path": "/api/cron/lorawan?daily=1", "schedule": "30 21 * * *" }
+  ]
+}
