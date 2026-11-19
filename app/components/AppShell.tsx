@@ -13,6 +13,7 @@ import { I18nProvider, useMessages, useT } from "@/lib/i18n/context";
 import ImpersonationBanner from "./ImpersonationBanner";
 import type { Messages, Locale } from "@/lib/i18n";
 import { BOTTOM_NAV_MAX, NAV_META, sanitizeBottomNav } from "@/lib/nav-meta";
+import BrandLogo from "@/app/components/BrandLogo";
 
 /**
  * Navigare „optimistă": la click, elementul apăsat devine activ și titlul se schimbă pe loc (nu după ce vine răspunsul serverului), iar sus apare
@@ -318,7 +319,7 @@ function AppShellInner({
         {/* Sidebar desktop */}
         <aside className="sticky top-0 hidden h-dvh flex-col overflow-hidden border-r border-[var(--color-line)] bg-[var(--color-surface)] p-4 lg:flex">
           <div className="shrink-0">
-            <Brand label={appointmentsLabel} />
+            <Brand />
           </div>
           {/* Meniul derulează singur când nu încap toate elementele (ecran mic / multe pagini); brandul și contul rămân fixate */}
           <div className="sidebar-scroll -mr-2 mt-6 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-2">
@@ -335,7 +336,7 @@ function AppShellInner({
             <div className="absolute inset-0 bg-black/40" onClick={() => setDrawer(false)} />
             <aside className="absolute left-0 top-0 flex h-full w-72 flex-col overflow-hidden bg-[var(--color-surface)] p-4 pt-[max(1rem,env(safe-area-inset-top))] pb-[max(1rem,env(safe-area-inset-bottom))]">
               <div className="shrink-0">
-                <Brand label={appointmentsLabel} />
+                <Brand />
               </div>
               <div className="sidebar-scroll -mr-2 mt-6 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-2">
                 <NavList onNavigate={() => setDrawer(false)} perms={perms} items={NAV} appointmentsLabel={appointmentsLabel} />
@@ -472,17 +473,14 @@ function BottomNav({ perms, appointmentsLabel, chosen }: { perms?: Record<string
   );
 }
 
-function Brand({ label = "Programări" }: { label?: string }) {
-  const t = useT();
+/** Sigla + numele aplicației: „Aqua” fix, „CRM” cu culoarea care curge lin între albastru închis și deschis. */
+function Brand() {
   return (
     <div className="flex items-center gap-2.5 px-1">
-      <div className="grid size-9 place-items-center rounded-xl bg-brand text-white">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round">
-          <rect x="3" y="4.5" width="18" height="16" rx="2.5" />
-          <path d="M3 9h18M8 2.5v4M16 2.5v4" />
-        </svg>
-      </div>
-      <span className="text-base font-bold">{t(label)}</span>
+      <BrandLogo size={36} />
+      <span className="text-lg font-bold leading-none">
+        Aqua<span className="aqua-wave">CRM</span>
+      </span>
     </div>
   );
 }
