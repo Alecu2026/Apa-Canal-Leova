@@ -3836,4 +3836,13 @@ export const EN: Record<string, string> = {
   "Ce trebuie să se vadă în poză:": "What must be visible in the picture:",
   "Încarcă poza": "Upload the picture",
   "Apasă oriunde în cadru ca să alegi o poză de pe dispozitiv, sau lipește-o cu Ctrl+V, sau trage-o aici. Poza se optimizează singură.": "Click anywhere in the frame to choose a picture from the device, or paste it with Ctrl+V, or drag it here. The picture is optimized automatically.",
+  "Nou": "New",
+  "LoRaWAN": "LoRaWAN",
+  "Aspect factură Apă-Canal": "Water-Sewer invoice layout",
+  "Conturi portal": "Portal accounts",
+  "Închide meniul": "Close the menu",
+  "Deschide meniul": "Open the menu",
+  "nereguli": "issues",
+  "Se afișează doar primele {n} rânduri; restul apar când se încarcă lista completă.": "Only the first {n} rows are shown; the rest appear when the full list has loaded.",
+  "Toți {n}": "All {n}",
 };

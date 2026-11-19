@@ -250,6 +250,49 @@ export default function AppShell({
   );
 }
 
+type Crumb = { href: string | null; label: string };
+
+/**
+ * Traseul paginii curente pentru antet („Plătitori › Plătitor › Decontare”): fiecare nivel din adresă, cu eticheta lui; nivelurile de deasupra sunt linkuri, ultimul e titlul.
+ * Paginile care au meniu își iau eticheta de acolo; subpaginile (Tabel 1C, Decontare, Nou…) dintr-o listă; un id (plătitor, contor, factură…) devine „Plătitor”, „Contor” etc.
+ * Un nivel fără pagină proprie (ex. „Administrare”) apare ca text, nu ca link.
+ */
+function buildCrumbs(path: string, t: (key: string) => string, nav: Messages["nav"]): Crumb[] {
+  const segs = path.split("?")[0].split("#")[0].split("/").filter(Boolean);
+  const sub: Record<string, string> = {
+    tabel: t("Tabel 1C"),
+    decontare: t("Decontare"),
+    new: t("Nou"),
+    edit: t("Editează"),
+    lorawan: t("LoRaWAN"),
+    admin: t("Administrare"),
+    "apa-canal-layout": t("Aspect factură Apă-Canal"),
+    "portal-accounts": t("Conturi portal"),
+  };
+  const idLabel: Record<string, string> = {
+    platitori: t("Plătitor"),
+    contoare: t("Contor"),
+    invoices: t("Factură"),
+    tasks: t("Sarcină"),
+    tickets: t("Cerere"),
+    projects: t("Proiect"),
+  };
+  // pagini cu un id în adresă care chiar există (pentru linkul de pe nivelul de deasupra)
+  const idPages = new Set(["platitori", "contoare", "tasks", "tickets", "projects"]);
+  const extraPages = new Set(["/platitori", "/contoare", "/invoices", "/tasks", "/tickets", "/projects", "/settings"]);
+  const out: Crumb[] = [];
+  let acc = "";
+  segs.forEach((s, i) => {
+    acc += `/${s}`;
+    const navItem = NAV.find((n) => n.href === acc);
+    const isId = !sub[s] && !navItem && /\d/.test(s) && s.length >= 6;
+    const label = navItem ? nav[navItem.labelKey] : (sub[s] ?? (isId ? (idLabel[segs[0]] ?? t("Detalii")) : s));
+    const linkable = !!navItem || extraPages.has(acc) || (isId && idPages.has(segs[0]));
+    out.push({ href: i < segs.length - 1 && linkable ? acc : null, label });
+  });
+  return out;
+}
+
 function AppShellInner({
   userName,
   demo = false,
@@ -270,6 +313,7 @@ function AppShellInner({
   children: ReactNode;
 }) {
   const [drawer, setDrawer] = useState(false);
+  const t = useT();
   // Sidebar-ul se poate închide / deschide din butonul de la mijlocul marginii lui; pagina preia spațiul eliberat. Alegerea se ține minte în browser.
   const [collapsed, setCollapsed] = useState(false);
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -322,6 +366,7 @@ function AppShellInner({
   // titlul: elementul de meniu cu adresa cea mai specifică (ex. „Citiri teren” înainte de „Contoare”)
   const hit = NAV.filter((n) => path.startsWith(n.href)).sort((a, b) => b.href.length - a.href.length)[0];
   const current = hit ? m.nav[hit.labelKey] : m.nav.dashboard;
+  const crumbs = buildCrumbs(path, t, m.nav);
 
   return (
     <ToastProvider>
@@ -372,10 +417,10 @@ function AppShellInner({
         <button
           type="button"
           onClick={toggleSidebar}
-          aria-label={m.menu}
+          aria-label={(drawer || !collapsed) ? t("Închide meniul") : t("Deschide meniul")}
           aria-expanded={drawer || !collapsed}
-          title={m.menu}
-          className={`fixed top-1/2 z-[60] grid h-14 w-5 -translate-y-1/2 cursor-pointer place-items-center rounded-r-lg border border-l-0 border-[var(--color-line)] bg-[var(--color-surface)] text-ink-soft shadow-md transition-[left] duration-200 hover:bg-brand-soft hover:text-brand ${drawer ? "left-72" : "left-0"} ${collapsed ? "lg:left-0" : "lg:left-[260px]"}`}
+          title={(drawer || !collapsed) ? t("Închide meniul") : t("Deschide meniul")}
+          className={`tap fixed top-1/2 z-[60] grid h-16 w-6 -translate-y-1/2 cursor-pointer place-items-center rounded-r-xl border border-l-0 border-[var(--color-line)] bg-[var(--color-surface)] text-ink-soft shadow-md transition-[left] duration-200 hover:bg-brand-soft hover:text-brand ${drawer ? "left-72" : "left-0"} ${collapsed ? "lg:left-0" : "lg:left-[260px]"}`}
         >
           {/* săgeata arată direcția acțiunii: spre stânga = se închide, spre dreapta = se deschide */}
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${drawer ? "" : "max-lg:rotate-180"} ${collapsed ? "lg:rotate-180" : ""}`} aria-hidden>
@@ -396,7 +441,24 @@ function AppShellInner({
                 <path d="M4 6h16M4 12h16M4 18h16" />
               </svg>
             </button>
-            <h1 className="text-lg font-bold lg:text-xl">{current}</h1>
+            {crumbs.length > 1 ? (
+              <h1 className="flex min-w-0 items-center gap-1.5 text-lg font-bold lg:text-xl">
+                {crumbs.map((c, i) => (
+                  <span key={`${c.label}-${i}`} className={`flex min-w-0 items-center gap-1.5 ${i === crumbs.length - 1 ? "" : "shrink-0 max-sm:hidden"}`}>
+                    {i > 0 && <span className="text-ink-soft/60 max-sm:hidden" aria-hidden>›</span>}
+                    {c.href ? (
+                      <Link href={c.href} className="text-sm font-medium text-ink-soft hover:text-brand lg:text-base">{c.label}</Link>
+                    ) : i === crumbs.length - 1 ? (
+                      <span className="truncate">{c.label}</span>
+                    ) : (
+                      <span className="text-sm font-medium text-ink-soft lg:text-base">{c.label}</span>
+                    )}
+                  </span>
+                ))}
+              </h1>
+            ) : (
+              <h1 className="text-lg font-bold lg:text-xl">{current}</h1>
+            )}
             <div className="ml-auto flex items-center gap-2">
               <LanguageSwitcher />
               {(perms?.["tasks.create"] !== false || perms?.["projects.create"] !== false || perms?.["clients.create"] !== false) && <VoiceTaskButton />}

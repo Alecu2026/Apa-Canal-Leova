@@ -4,7 +4,7 @@ import { getT } from "@/lib/i18n/server-t";
  * „Ce date NU vin din noul 1C” — lista clară a ce lipsește și ce efect are în aplicație (coloane / filtre goale). Folosită pe lista Plătitori (restrânsă)
  * și pe fișa plătitorului. Conținutul reflectă exact formatul avizelor 1C (…/infoCec/info/apl): vezi lib/apa-canal-1c.ts.
  */
-export default async function OneCMissingNotice({ collapsible = false }: { collapsible?: boolean }) {
+export default async function OneCMissingNotice({ collapsible = false, compact = false }: { collapsible?: boolean; compact?: boolean }) {
   const tr = await getT();
   const items: [string, string][] = [
     [tr("Telefon și email"), tr("Notificările SMS, apel și email nu au destinatar. Se introduc manual sau din Excel, după codul abonatului.")],
@@ -32,6 +32,17 @@ export default async function OneCMissingNotice({ collapsible = false }: { colla
     </>
   );
   if (!collapsible) return <div className="p-3">{body}</div>;
+  // compact: un buton mic în bara de sus; lista se deschide într-o fereastră plutitoare (nu ocupă loc din listă)
+  if (compact) {
+    return (
+      <details className="relative">
+        <summary className="tap inline-flex h-7 cursor-pointer list-none items-center gap-1 rounded-lg border border-[var(--color-line)] px-2 text-[11px] font-medium text-ink-soft hover:bg-[var(--color-surface-2)]">
+          ⓘ {tr("Ce date lipsesc din noul 1C")} ({items.length})
+        </summary>
+        <div className="card absolute left-0 top-full z-40 mt-1 max-h-[70dvh] w-[min(34rem,92vw)] overflow-auto p-3 shadow-xl">{body}</div>
+      </details>
+    );
+  }
   return (
     <details className="card mb-3 p-3">
       <summary className="cursor-pointer text-sm font-semibold">
