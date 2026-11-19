@@ -14,7 +14,7 @@ export default async function FieldReadingsPage({ searchParams }: { searchParams
   const user = await requirePermission("meters.read");
   const sp = await searchParams;
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <div className="mb-3">
         <h1 className="text-xl font-bold">{t("Citiri teren")}</h1>
         <p className="mt-0.5 text-sm text-ink-soft">{t("Alege contorul, scrie indexul (m³) de luna aceasta — locația se ia automat — și, dacă vrei, fă o poză contorului.")}</p>

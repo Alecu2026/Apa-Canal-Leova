@@ -51,7 +51,7 @@ export default async function PayersPage({
   if (!version || jar.get(PAYERS_V_COOKIE)?.value !== version) preload("/api/platitori/snapshot", { as: "fetch", crossOrigin: "anonymous" });
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold">{t("Plătitori")}</h1>

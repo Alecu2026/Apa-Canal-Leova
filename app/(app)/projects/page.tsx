@@ -31,7 +31,7 @@ export default async function ProjectsPage({
   const big = snap.count > PROJECT_INLINE_MAX;
   const projects = withCounts(big ? snap.rows.slice(0, PROJECT_HEAD_ROWS) : snap.rows, counts.map);
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <ProjectsTable canExport={can(user, "projects.export")} canImport={can(user, "projects.import")} projects={projects} total={snap.count} version={big ? snap.version : null} users={users} teams={teams} clients={clients} openCreate={sp.create === "1"} canEdit={can(user, "projects.edit")} canCreate={can(user, "projects.create")} canDelete={can(user, "projects.delete")} canCreateTask={can(user, "tasks.create")} />
     </div>
   );

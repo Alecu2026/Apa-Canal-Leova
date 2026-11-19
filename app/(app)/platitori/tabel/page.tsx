@@ -21,7 +21,7 @@ export default async function OneCTablePage() {
   const jar = await cookies();
   if (!v || jar.get(ONEC_V_COOKIE)?.value !== v.replace(/[^0-9a-zA-Z]/g, "")) preload("/api/platitori/tabel/snapshot?period=latest", { as: "fetch", crossOrigin: "anonymous" });
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <Link href="/platitori" className="mb-3 inline-flex items-center gap-1 text-sm text-ink-soft hover:text-ink">
         <IconChevronLeft className="size-4" /> {t("Înapoi la plătitori")}
       </Link>

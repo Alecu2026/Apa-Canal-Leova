@@ -49,7 +49,7 @@ export default async function DeliveryLogsPage({ searchParams }: { searchParams:
   );
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <div className="mb-3">
         <h1 className="text-lg font-bold">{t("Jurnal notificări")}</h1>
         <p className="text-xs text-ink-soft">

@@ -183,7 +183,7 @@ export default function OneCTable({ canExport = true }: { canExport?: boolean } 
   const colSpan = ONEC_COLUMNS.length + 4;
 
   return (
-    <div data-onec="" data-mode={serverMode ? "server" : "local"}>
+    <div data-onec="" data-mode={serverMode ? "server" : "local"} className="fit-fill">
       <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
         <select
           value={period}
@@ -256,7 +256,7 @@ export default function OneCTable({ canExport = true }: { canExport?: boolean } 
         </p>
       )}
 
-      <div ref={box} className="card overflow-auto" style={{ maxHeight: "68vh" }} onScroll={virt ? (e) => setScrollTop(e.currentTarget.scrollTop) : undefined} data-onec-scroll="">
+      <div ref={box} className="card fit-scroll overflow-auto" style={{ maxHeight: "68vh" }} onScroll={virt ? (e) => setScrollTop(e.currentTarget.scrollTop) : undefined} data-onec-scroll="">
         <table className="w-max min-w-full border-separate border-spacing-0 text-xs">
           <thead className="sticky top-0 z-20 bg-[var(--color-surface-2)]">
             <tr>

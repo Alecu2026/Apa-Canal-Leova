@@ -183,7 +183,7 @@ const DeliveryTable = memo(function DeliveryTable({
       ref={scrollRef}
       onScroll={virtual ? onScroll : undefined}
       role="table"
-      className={`overflow-auto rounded-xl border border-[var(--color-line)] transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
+      className={`fit-scroll overflow-auto rounded-xl border border-[var(--color-line)] transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
       style={{ maxHeight: rowCount > 40 ? "max(76vh, 640px)" : undefined, overflowAnchor: "none" }}
     >
       <div role="row" className={`sticky top-0 z-10 hidden border-b border-[var(--color-line)] bg-[var(--color-surface-2)] px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-ink-soft ${GRID}`}>

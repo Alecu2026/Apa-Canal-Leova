@@ -69,7 +69,7 @@ export default async function MetersPage({
   if (!version || jar.get(METERS_V_COOKIE)?.value !== version) preload("/api/contoare/snapshot", { as: "fetch", crossOrigin: "anonymous" });
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold">{t("Contoare")}</h1>

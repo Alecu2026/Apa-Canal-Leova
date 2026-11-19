@@ -576,7 +576,7 @@ export default function DataTable<T extends { id: string }>({
 
 
   return (
-    <div>
+    <div className="fit-fill">
       <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
         {filters.length > 0 && <FiltersToggle open={fOpen} onToggle={toggleF} activeCount={activeCount} />}
         {fOpen && filters.map((f) =>
@@ -724,7 +724,7 @@ export default function DataTable<T extends { id: string }>({
       {hideRows ? (
         <div className="card animate-pulse p-8 text-center text-ink-soft">{t("Se încarcă lista completă… filtrele se aplică imediat ce e gata.")}</div>
       ) : cards ? (
-        <div className={`flex flex-col gap-1.5 ${TEXT_CLS[look.text]}`}>
+        <div className={`fit-scroll flex flex-col gap-1.5 ${TEXT_CLS[look.text]}`}>
           {(() => {
             const renderCard = (r: T) => {
             // Rezumat: primele trei coloane vizibile (titlu + două valori scurte); restul se vede la desfacere.
@@ -778,7 +778,7 @@ export default function DataTable<T extends { id: string }>({
       ) : (
       <div
         ref={scrollBox}
-        className="card dt-root overflow-auto"
+        className="card dt-root fit-scroll overflow-auto"
         style={{ maxHeight: perPage > 50 ? "max(78vh, 890px)" : undefined, ...colorVars(colors) }}
         onScroll={virt ? (e) => {
           const top = e.currentTarget.scrollTop;

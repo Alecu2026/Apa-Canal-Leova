@@ -37,7 +37,7 @@ export default async function PbxPage({ searchParams }: { searchParams: Promise<
   if (tab === "notificari") {
     const queue = DEMO ? [] : (await notifyHead()).rows;
     return (
-      <div className="w-full">
+      <div className="w-full fit-page">
         {tabs}
         <NotifyCallsTable rows={queue} defaultOperator={env.pbx.callUser} canManage={can(user, "pbx.manage")} />
       </div>
@@ -47,7 +47,7 @@ export default async function PbxPage({ searchParams }: { searchParams: Promise<
   const rows = DEMO ? [] : (await callsHead()).rows;
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       {tabs}
       <PbxTable rows={rows} webhookUrl={`${env.appUrl.replace(/\/$/, "")}/api/pbx`} tokenConfigured={!!env.pbx.crmToken} canManage={can(user, "pbx.manage")} canTask={can(user, "tasks.create")} canClient={can(user, "clients.create")} />
     </div>

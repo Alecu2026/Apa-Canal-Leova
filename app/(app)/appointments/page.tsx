@@ -40,18 +40,20 @@ export default async function AppointmentsPage({
   };
 
   return (
-    <AppointmentsTable
-      items={items}
-      manifest={manifest}
-      categories={categories}
-      quickDefaults={quickDefaults}
-      initialCreate={create === "1"}
-      today={today}
-      tz={tz}
-      canManage={can(user, "appointments.manage")}
-      canExport={can(user, "appointments.export")}
-      canImport={can(user, "appointments.import")}
-      userId={user.id}
-    />
+    <div className="w-full fit-page">
+      <AppointmentsTable
+        items={items}
+        manifest={manifest}
+        categories={categories}
+        quickDefaults={quickDefaults}
+        initialCreate={create === "1"}
+        today={today}
+        tz={tz}
+        canManage={can(user, "appointments.manage")}
+        canExport={can(user, "appointments.export")}
+        canImport={can(user, "appointments.import")}
+        userId={user.id}
+      />
+    </div>
   );
 }

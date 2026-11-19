@@ -782,7 +782,7 @@ export default function InvoicesList({
       <div
         ref={scrollRef}
         onScroll={virtualTable ? onTableScroll : undefined}
-        className={`card overflow-auto transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
+        className={`card fit-scroll overflow-auto transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
         style={{ maxHeight: rows.length > 50 ? "max(78vh, 890px)" : undefined }}
       >
         <table className="min-w-full table-fixed border-separate border-spacing-0 text-[11px] leading-[14px]" style={{ width: COL_W.reduce((a, b) => a + b, 0) }}>

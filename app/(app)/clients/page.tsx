@@ -48,7 +48,7 @@ export default async function ClientsPage({
   }
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <ClientsTable canExport={can(user, "clients.export")} canImport={can(user, "clients.import")} items={rows} total={total} version={version} openCreate={create === "1"} prefill={fromCall} canEdit={can(user, "clients.edit")} canCreate={can(user, "clients.create")} canDelete={can(user, "clients.delete")} />
     </div>
   );

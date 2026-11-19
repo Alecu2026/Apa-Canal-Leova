@@ -139,7 +139,7 @@ export default function ClientNotifyManager({
   );
 
   return (
-    <div>
+    <div className="fit-fill">
       <div className="mb-2 flex flex-wrap items-center gap-2">
         <input
           value={q}
@@ -192,7 +192,7 @@ export default function ClientNotifyManager({
         {loading ? ` · ${t("se încarcă…")}` : ""}
       </p>
 
-      <div className="overflow-auto rounded-lg border border-[var(--color-line)]">
+      <div className="fit-scroll overflow-auto rounded-lg border border-[var(--color-line)]">
         <table className="w-full text-left text-sm">
           <thead className="bg-[var(--color-surface-2)] text-[11px] text-ink-soft">
             <tr>

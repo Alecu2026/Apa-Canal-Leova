@@ -668,7 +668,7 @@ export default function PayerNotifyManager({
   };
 
   return (
-    <div>
+    <div className="fit-fill">
       {!browseOnly && !emailEnabled && !smsEnabled && (
         <div className="mb-3 rounded-xl border border-st-progress/30 bg-st-progress/10 px-4 py-3 text-sm text-st-progress">
           {t("Niciun canal de trimitere nu este configurat. Setează SMTP_* pentru email și TWILIO_* sau SMS_HTTP_URL pentru SMS (vezi .env.example).")}
@@ -1068,7 +1068,7 @@ export default function PayerNotifyManager({
 
       {/* ── Tabel (stil 1C) ───────────────────────────────────────────────── */}
       {cards ? (
-        <div className={`flex flex-col gap-1.5 transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}>
+        <div className={`fit-scroll flex flex-col gap-1.5 transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}>
           {renderRows(pageRows, (r, i) => {
             const sel = selected.has(r.id);
             const st = r.latestInvoice ? INVOICE_STATUS[r.latestInvoice.status as InvoiceStatusKey] : null;
@@ -1156,7 +1156,7 @@ export default function PayerNotifyManager({
       <div
         ref={scrollRef}
         onScroll={virtualTable ? onTableScroll : undefined}
-        className={`card overflow-auto transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
+        className={`card fit-scroll overflow-auto transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
         style={{ maxHeight: rowCount > 50 ? "max(78vh, 890px)" : undefined }}
       >
         <table className="min-w-full table-fixed border-separate border-spacing-0 text-[11px] leading-[14px]" style={{ width: COL_W.reduce((a, b) => a + b, 0) + (canSelect ? 28 : 0) + (canSend ? 32 : 0) + (canTask ? 50 : 0) }}>

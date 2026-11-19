@@ -172,7 +172,7 @@ export default function NotificationsInbox({ userId, canAppointments }: { userId
   const fkey = `${JSON.stringify(f)}|${perPage}`;
   const totalPages = Math.max(1, Math.ceil(filtered.length / perPage));
   const curPage = Math.min(pg.key === fkey ? pg.page : 1, totalPages);
-  const setPage = useCallback((n: number) => { setPg({ key: fkey, page: n }); window.scrollTo({ top: 0 }); }, [fkey]);
+  const setPage = useCallback((n: number) => { setPg({ key: fkey, page: n }); window.scrollTo({ top: 0 }); document.getElementById("app-main")?.scrollTo({ top: 0 }); }, [fkey]);
   const paged = useMemo(() => (filtered.length <= perPage ? filtered : filtered.slice((curPage - 1) * perPage, curPage * perPage)), [filtered, perPage, curPage]);
   const from = filtered.length === 0 ? 0 : (curPage - 1) * perPage + 1;
   const to = Math.min(curPage * perPage, filtered.length);

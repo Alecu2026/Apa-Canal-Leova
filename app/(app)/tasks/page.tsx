@@ -74,7 +74,7 @@ export default async function TasksPage({
   const initialAddress = initialCreate && can(user, "tasks.create") ? await payerAddress(sp.client) : undefined;
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       <TasksTable
         items={result.items}
         dataset={result.dataset ? { total: result.total } : undefined}

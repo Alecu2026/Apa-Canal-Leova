@@ -299,7 +299,7 @@ export default function ManualView({
           <summary className="flex cursor-pointer items-center gap-2 text-sm font-semibold"><MIcon name="book" className="size-4 text-brand" />{t("Cuprins")}</summary>
           <div className="mt-2">{toc}</div>
         </details>
-        <nav className="card hidden max-h-[calc(100dvh_-_var(--imp-h,0px)_-_6.5rem)] overflow-auto p-3 lg:sticky lg:top-[calc(var(--imp-h,0px)_+_5rem)] lg:block" aria-label={t("Cuprins")}>
+        <nav className="card hidden max-h-[calc(100dvh_-_var(--imp-h,0px)_-_6.5rem)] overflow-auto p-3 lg:sticky lg:top-2 lg:block" aria-label={t("Cuprins")}>
           <p className="mb-2 flex items-center gap-2 px-1 text-[11px] font-semibold uppercase tracking-wide text-ink-soft"><MIcon name="book" className="size-4 text-brand" />{t("Cuprins")}</p>
           {toc}
         </nav>

@@ -527,3 +527,22 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .aqua-border { animation: none; --aqua-s: -40deg; --aqua-e: 400deg; }
 }
+
+/* ── „O pagină = un ecran” ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+   Aplicația are înălțimea dispozitivului (h-dvh în AppShell): documentul nu derulează. Paginile de listă (rădăcina cu .fit-page) împart ecranul
+   astfel: titlul și filtrele rămân sus, cardul cu tabelul (.fit-scroll) ia tot restul și derulează DOAR în interior (antetul tabelului e lipit sus),
+   iar paginarea rămâne vizibilă dedesubt. Lanțul de containere dintre rădăcină și card poartă .fit-fill. Dacă lanțul se întrerupe undeva,
+   pagina derulează în zona de conținut (antetul aplicației rămâne oricum fix) — nu se pierde nimic. Procente din ecran, deci la fel pe orice dispozitiv. */
+.app-main:has(> .fit-page) {
+  display: flex;
+  flex-direction: column;
+  /* mobil: doar bara de jos (fixă) + spațiu mic; fără rezerva pentru butonul „+”, care plutește peste colț */
+  padding-bottom: calc(3.75rem + env(safe-area-inset-bottom, 0px) + 0.5rem);
+}
+@media (min-width: 1024px) {
+  .app-main:has(> .fit-page) { padding-bottom: 1rem; }
+}
+.fit-page { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; width: 100%; }
+.fit-page .fit-fill { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; }
+.fit-page .fit-scroll { flex: 1 1 auto; min-height: 0; max-height: none !important; overflow: auto; overscroll-behavior: contain; }
+.fit-page .fit-fixed { flex: 0 0 auto; }

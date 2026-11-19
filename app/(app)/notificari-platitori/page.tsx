@@ -51,7 +51,7 @@ export default async function PayerNotificationsPage({
   if (clientsView) {
     const templates = await listPayerTemplates();
     return (
-      <div className="w-full">
+      <div className="w-full fit-page">
         {tabs}
         <p className="mb-3 text-sm text-ink-soft">
           {t("Clienții obișnuiți din CRM (fără plătitorii din 1C). Bifează destinatarii sau ia-i pe toți din filtru și trimite-le email, SMS sau apel — acum sau programat (o dată, zilnic, săptămânal, lunar). Totul apare în Jurnalul de notificări.")}
@@ -127,7 +127,7 @@ export default async function PayerNotificationsPage({
   ]);
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       {tabs}
       <div className="mb-4">
         <p className="text-sm text-ink-soft">

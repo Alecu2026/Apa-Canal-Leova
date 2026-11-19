@@ -358,7 +358,7 @@ export default function MetersManager({
   const water = (vol: number | null, sum: number | null) => (vol == null && sum == null ? null : `${vol == null ? "—" : num(vol)} m³ · ${sum == null ? "—" : `${money(sum)} MDL`}`);
 
   return (
-    <div>
+    <div className="fit-fill">
       {/* ── Filtre (stil Plătitori: colorate când sunt active) ─────────────────── */}
       <div className="mb-1.5 flex flex-wrap items-center gap-1.5">
         <FiltersToggle open={fOpen} onToggle={toggleF} activeCount={active} />
@@ -811,7 +811,7 @@ const GridTable = memo(function GridTable({
     <div
       ref={scrollRef}
       onScroll={virtual ? onScroll : undefined}
-      className={`card overflow-auto transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
+      className={`card fit-scroll overflow-auto transition-opacity duration-150 ${loading ? "opacity-60" : ""}`}
       style={{ maxHeight: rowCount > 50 ? "max(78vh, 890px)" : undefined, overflowAnchor: "none" }}
     >
       <div role="table" className="text-[11px]" style={{ width: GRID_W + (canTask ? 28 : 0), minWidth: "100%" }}>

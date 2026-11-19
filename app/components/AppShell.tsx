@@ -270,6 +270,17 @@ function AppShellInner({
   children: ReactNode;
 }) {
   const [drawer, setDrawer] = useState(false);
+  // Sidebar-ul se poate închide / deschide din butonul de la mijlocul marginii lui; pagina preia spațiul eliberat. Alegerea se ține minte în browser.
+  const [collapsed, setCollapsed] = useState(false);
+  // eslint-disable-next-line react-hooks/set-state-in-effect
+  useEffect(() => { try { if (localStorage.getItem("shell:sidebar") === "0") setCollapsed(true); } catch {} }, []);
+  const mainRef = useRef<HTMLElement>(null);
+  const toggleSidebar = () => {
+    // pe ecran lat: strânge / desface coloana; pe ecran îngust: deschide / închide sertarul
+    if (typeof window !== "undefined" && window.matchMedia("(min-width: 1024px)").matches) {
+      setCollapsed((c) => { const n = !c; try { localStorage.setItem("shell:sidebar", n ? "0" : "1"); } catch {} return n; });
+    } else setDrawer((d) => !d);
+  };
   // Clopoțelul „live”: numărul de necitite vine de la server la încărcare, apoi se reîmprospătează la ~30 s (doar cât tab-ul e vizibil) și când inbox-ul marchează notificări citite.
   const [unreadLive, setUnreadLive] = useState(unread);
   // eslint-disable-next-line react-hooks/set-state-in-effect
@@ -306,6 +317,7 @@ function AppShellInner({
   // încarcă progresiv. Resetăm explicit la fiecare schimbare de rută.
   useEffect(() => {
     window.scrollTo(0, 0);
+    mainRef.current?.scrollTo(0, 0);
   }, [realPath]);
   // titlul: elementul de meniu cu adresa cea mai specifică (ex. „Citiri teren” înainte de „Contoare”)
   const hit = NAV.filter((n) => path.startsWith(n.href)).sort((a, b) => b.href.length - a.href.length)[0];
@@ -316,18 +328,25 @@ function AppShellInner({
       <NavPending.Provider value={{ pending, go: (href, from) => (href === from ? setPending(null) : setPending({ href, from })) }}>
       {pending && pending.from === realPath && <div className="nav-progress" aria-hidden />}
       <NavWarmup hrefs={visibleNav(NAV, perms).map((n) => n.href)} />
-      <div className="lg:grid lg:grid-cols-[260px_1fr]">
-        {/* Sidebar desktop */}
-        <aside className="sticky top-0 hidden h-dvh flex-col overflow-hidden border-r border-[var(--color-line)] bg-[var(--color-surface)] p-4 lg:flex">
-          <div className="shrink-0">
-            <Brand />
-          </div>
-          {/* Meniul derulează singur când nu încap toate elementele (ecran mic / multe pagini); brandul și contul rămân fixate */}
-          <div className="sidebar-scroll -mr-2 mt-6 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-2">
-            <NavList perms={perms} items={NAV} appointmentsLabel={appointmentsLabel} />
-          </div>
-          <div className="shrink-0">
-            <Account userName={userName} />
+      {/* Aplicația ocupă exact ecranul (procent din înălțimea dispozitivului): documentul nu derulează, ci doar zona de conținut / tabelul din ea — antetul și titlurile rămân mereu vizibile. */}
+      <div className="flex h-dvh overflow-hidden">
+        {/* Sidebar desktop: coloană care se strânge la 0 (pagina preia locul); conținutul interior păstrează lățimea de 260 px, ca să nu se turtească în timpul animației */}
+        <aside
+          aria-hidden={collapsed}
+          inert={collapsed}
+          className={`hidden h-dvh shrink-0 overflow-hidden bg-[var(--color-surface)] transition-[width] duration-200 lg:block ${collapsed ? "w-0" : "w-[260px] border-r border-[var(--color-line)]"}`}
+        >
+          <div className="flex h-full w-[260px] flex-col p-4">
+            <div className="shrink-0">
+              <Brand />
+            </div>
+            {/* Meniul derulează singur când nu încap toate elementele (ecran mic / multe pagini); brandul și contul rămân fixate */}
+            <div className="sidebar-scroll -mr-2 mt-6 min-h-0 flex-1 overflow-y-auto overscroll-contain pr-2">
+              <NavList perms={perms} items={NAV} appointmentsLabel={appointmentsLabel} />
+            </div>
+            <div className="shrink-0">
+              <Account userName={userName} />
+            </div>
           </div>
         </aside>
 
@@ -349,7 +368,22 @@ function AppShellInner({
           </div>
         )}
 
-        <div className="flex min-h-dvh min-w-0 flex-col" style={impersonation ? ({ "--imp-h": "calc(2.25rem + env(safe-area-inset-top, 0px))" } as CSSProperties) : undefined}>
+        {/* Butonul de la mijlocul marginii sidebar-ului: închide / deschide (ecran lat: strânge coloana; ecran îngust: sertarul). Stă lipit de marginea lui, deci urmărește lățimea. */}
+        <button
+          type="button"
+          onClick={toggleSidebar}
+          aria-label={m.menu}
+          aria-expanded={drawer || !collapsed}
+          title={m.menu}
+          className={`fixed top-1/2 z-[60] grid h-14 w-5 -translate-y-1/2 cursor-pointer place-items-center rounded-r-lg border border-l-0 border-[var(--color-line)] bg-[var(--color-surface)] text-ink-soft shadow-md transition-[left] duration-200 hover:bg-brand-soft hover:text-brand ${drawer ? "left-72" : "left-0"} ${collapsed ? "lg:left-0" : "lg:left-[260px]"}`}
+        >
+          {/* săgeata arată direcția acțiunii: spre stânga = se închide, spre dreapta = se deschide */}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform ${drawer ? "" : "max-lg:rotate-180"} ${collapsed ? "lg:rotate-180" : ""}`} aria-hidden>
+            <path d="M15 18l-6-6 6-6" />
+          </svg>
+        </button>
+
+        <div className="flex h-dvh min-w-0 flex-1 flex-col" style={impersonation ? ({ "--imp-h": "calc(2.25rem + env(safe-area-inset-top, 0px))" } as CSSProperties) : undefined}>
           {impersonation && <ImpersonationBanner who={impersonation.who} by={impersonation.by} expiresAt={impersonation.expiresAt} serverNow={impersonation.serverNow} exitAction="/api/simulare/exit" className="sticky top-0" />}
           {/* Header */}
           <header className={`sticky top-[var(--imp-h,0px)] z-30 flex items-center gap-3 border-b border-[var(--color-line)] bg-[var(--color-app)]/80 px-4 py-3 ${impersonation ? "" : "pt-[max(0.75rem,env(safe-area-inset-top))]"} backdrop-blur`}>
@@ -389,7 +423,7 @@ function AppShellInner({
               {m.demo}
             </div>
           )}
-          <main className="flex-1 px-4 pb-[calc(9.5rem+env(safe-area-inset-bottom))] pt-5 lg:px-8 lg:pb-10">{children}</main>
+          <main ref={mainRef} id="app-main" className="app-main min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 pb-[calc(9.5rem+env(safe-area-inset-bottom))] pt-5 lg:px-8 lg:pb-10">{children}</main>
         </div>
       </div>
 

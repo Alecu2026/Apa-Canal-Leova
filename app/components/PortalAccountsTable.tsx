@@ -60,7 +60,7 @@ export default function PortalAccountsTable({ initial, total }: { initial: Porta
   const activated = rows.filter((r) => r.activated).length;
 
   return (
-    <div data-portal-accounts="" data-full={full ? "1" : "0"}>
+    <div data-portal-accounts="" data-full={full ? "1" : "0"} className="fit-fill">
     {!full && !error && (
       <p className="mb-1.5 flex items-center gap-2 text-xs text-ink-soft" data-loading-full="">
         <span className="inline-block size-3 animate-spin rounded-full border-2 border-brand border-t-transparent" />

@@ -44,7 +44,7 @@ export default async function InvoicesPage({
   }
 
   return (
-    <div className="w-full">
+    <div className="w-full fit-page">
       {/* doar administratorii: cât mai sunt facturi cu statusul necalculat din avans / datorii, apare butonul „Recalculează acum” (termină tot istoricul dintr-un foc) */}
       {can(user, "admin") && (
         <div className="mb-2">
