@@ -1685,3 +1685,29 @@ model OneCMapping {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
+
+/// Pozele (screenshot-urile) din „Manual de utilizare”: o poză pe loc (cheie din lib/manual/*). Poza OPTIMIZATĂ (WebP, cel mult 1600 px lățime) stă chiar aici, în baza de date, și se servește din /api/manual/shot/<cheie>.
+model ManualShot {
+  id        String   @id @default(auto()) @map("_id") @db.ObjectId
+  key       String   @unique
+  data      Bytes
+  mime      String   @default("image/webp")
+  size      Int
+  width     Int?
+  height    Int?
+  name      String
+  byId      String   @db.ObjectId
+  byName    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Starea „Manualului de utilizare”: ciornă (îl vede doar contul editor) sau publicat (apare și pentru ceilalți, după drepturile lor). Un singur rând; editorul apasă „Finalizat” când a pus pozele.
+model ManualState {
+  id          String    @id @default(auto()) @map("_id") @db.ObjectId
+  singleton   String    @unique @default("main")
+  published   Boolean   @default(false)
+  publishedAt DateTime?
+  byName      String?
+  updatedAt   DateTime  @updatedAt
+}
