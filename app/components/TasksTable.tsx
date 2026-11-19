@@ -5,6 +5,7 @@ import { addressCounts, REPEAT_OPTIONS, repeatsAtLeast } from "@/lib/address-rep
 import { describeSchedule, parseReminderSchedule } from "@/lib/reminder-schedule";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { NO_OPTS, useOptionList } from "./useOptionList";
 import RowColorPicker from "./RowColorPicker";
 import { deriveSectionId } from "@/lib/sections";
 import { setTaskColorAction } from "@/app/actions/row-color";
@@ -59,6 +60,7 @@ import { dateTag } from "@/lib/i18n/t";
 import { SERVICE_TYPES, SERVICE_TYPE_LABEL, serviceTypeLabel } from "@/lib/service-type";
 import { CONSUMER_TYPES, CONSUMER_TYPE_LABEL, consumerTypeLabel } from "@/lib/consumer-type";
 import { DEADLINE_FILTER_OPTIONS, DEADLINE_OVER, deadlineState, isOverDeadline } from "@/lib/task-deadline";
+import { taskNo, matchesTaskNo } from "@/lib/task-number";
 
 const PRIO_RANK = { LOW: 1, MEDIUM: 2, HIGH: 3, URGENT: 4 } as const;
 /** Prioritatea ca etichetă colorată (se vede și pe rânduri colorate / cu zebră): urgent roșu, ridicată portocaliu, medie albastru, scăzută gri. */
@@ -134,8 +136,8 @@ export default function TasksTable({
   teams,
   sections = [],
   teamMembers = {},
-  projects,
-  clients = [],
+  projects: projectsProp,
+  clients: clientsProp = NO_OPTS,
   categories = [],
   canCreate,
   canDelete,
@@ -237,6 +239,9 @@ export default function TasksTable({
   const [seenItems, setSeenItems] = useState(items);
   // Lista completă (când pagina a primit doar primele rânduri): înlocuiește rândurile din HTML imediat ce e gata.
   const router = useRouter();
+  // proiectele / clienții paginii: cei creați chiar acum din formular apar imediat (filtre, editare în tabel, formulare)
+  const [projects, addProject] = useOptionList(projectsProp);
+  const [clients, addClient] = useOptionList(clientsProp);
   const ds = useTaskDataset({ enabled: !!dataset, kind: ticketMode ? "TICKET" : "TASK", scope, userId });
   const [seenDs, setSeenDs] = useState<typeof ds.rows>(null);
   if (ds.rows && ds.rows !== seenDs) {
@@ -426,10 +431,10 @@ export default function TasksTable({
   const columns: Col<Task>[] = [
     ...(canEdit ? [{ key: "rc", label: "", minW: 28, render: (t: Task) => <div onClick={(e) => e.stopPropagation()}><RowColorPicker value={t.color ?? null} onChange={(c) => setColor(t, c)} /></div> } satisfies Col<Task>] : []),
     {
-      key: "seq", label: "#", minW: 45, sort: (t) => t.seq,
+      key: "seq", label: "#", minW: 80, sort: (t) => t.seq,
       render: (t) => (
         <button type="button" onClick={() => setOpenId(t.id)} title={tr("Deschide detaliile")} className="dt-ctl cursor-pointer rounded px-0.5 font-mono font-semibold text-brand hover:underline">
-          {t.seq != null ? `#${t.seq}` : "↗"}
+          {taskNo(t) ?? "↗"}
         </button>
       ),
     },
@@ -692,8 +697,7 @@ export default function TasksTable({
       {
         kind: "text", key: "q", label: "Caută", grow: true, placeholder: m.tasks.searchPlaceholder,
         test: (t, v) => {
-          const seq = v.match(/^#?(\d+)$/);
-          if (seq && t.seq === Number(seq[1])) return true;
+          if (matchesTaskNo(t, v)) return true;
           return derivedOf(t).hay.includes(v);
         },
       },
@@ -919,6 +923,8 @@ export default function TasksTable({
           templates={tpls}
           onPickTemplate={(id, clientId) => void startFromTemplate(id, clientId)}
           onClearTemplate={() => void clearTemplate()}
+          onProjectCreated={addProject}
+          onClientCreated={addClient}
           initialType={createType}
           users={users}
           teams={teams}
@@ -954,6 +960,7 @@ export default function TasksTable({
           quietHoursEnabled={quietHoursEnabled}
           canAssign={canAssign}
           onClose={() => setEditTask(null)}
+          onClientCreated={addClient}
           onSaved={(updated) => {
             touch(updated.id);
             setRows((cur) => cur.map((t) => (t.id === updated.id ? { ...t, ...updated } : t)));
@@ -1035,7 +1042,7 @@ function TaskDetailDialog({
         <div className="mb-2 flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h2 className="text-lg font-bold leading-tight">
-              {t.seq != null && <span className="mr-1.5 rounded bg-brand/10 px-1.5 font-mono text-xs font-semibold text-brand">#{t.seq}</span>}
+              {taskNo(t) != null && <span className="mr-1.5 rounded bg-brand/10 px-1.5 font-mono text-xs font-semibold text-brand">{taskNo(t)}</span>}
               {t.title}
             </h2>
             <p className="mt-0.5 text-xs text-ink-soft">

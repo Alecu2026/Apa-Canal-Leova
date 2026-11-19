@@ -19,7 +19,25 @@ export type SpecItem = {
 };
 /** Partea paginii: contractul propriu-zis, punctele „adiționale” din contract (licențe, funcționalități suplimentare) sau ce am adăugat noi peste contract. */
 export type SpecPart = "contract" | "additional" | "ours";
-export type SpecGroup = { id: string; part: SpecPart; code: string; titleEn: string; titleRo: string; introEn?: string; introRo?: string; items: Omit<SpecItem, "id">[] };
+export type SpecGroup = {
+  id: string;
+  part: SpecPart;
+  code: string;
+  titleEn: string;
+  titleRo: string;
+  introEn?: string;
+  introRo?: string;
+  items: Omit<SpecItem, "id">[];
+  /** Pozițiile (1, 2, 3…, cele originale) ale punctelor ȘTERSE din grup. Id-urile nu se schimbă: punctele rămase își păstrează id-ul (și bifa salvată), nu se renumerotează. */
+  removed?: number[];
+};
+
+/** Id-ul stabil al punctului de pe poziția `i` (de la 0) din lista curentă a grupului: ține cont de punctele șterse, ca bifele deja salvate să rămână la locul lor. */
+export function specItemId(g: Pick<SpecGroup, "id" | "removed">, i: number): string {
+  let pos = i + 1;
+  for (const r of [...(g.removed ?? [])].sort((a, b) => a - b)) if (r <= pos) pos++;
+  return `${g.id}-${pos}`;
+}
 
 const L = {
   tickets: { label: "Cereri", href: "/tickets" },
@@ -85,6 +103,7 @@ export const SPEC_GROUPS: SpecGroup[] = [
   },
   {
     id: "crm-info",
+    removed: [16], // „contul preplătit” — scos din caiet
     part: "contract",
     code: "3.1",
     titleEn: "Customer Information Management",
@@ -105,7 +124,6 @@ export const SPEC_GROUPS: SpecGroup[] = [
       { en: "Ability to search and present an integrated view of customer billing information.", ro: "Posibilitatea de a căuta și prezenta o imagine integrată a informațiilor de facturare ale clientului.", status: "done", where: "Fișa plătitorului: ultima factură, sold, scadență, istoric facturi, decontare (PDF), contoare și citiri într-un singur loc.", links: [L.payers] },
       { en: "Ability to present billing information at the account level (i.e. level for which invoicing takes place): billing cycle, billing address, frequency, payment methods.", ro: "Posibilitatea de a prezenta informații de facturare la nivel de cont: ciclu de facturare, adresă de facturare, frecvență, metode de plată.", status: "done", where: "Pe cont se văd ciclul de facturare (perioada de calcul a fiecărei facturi), adresa și facturile lunare (frecvență lunară), cu data emiterii, scadența și suma. Plățile și metoda de plată nu vin încă din 1C; când vor veni, se adaugă la cont.", links: [L.payers, L.invoices] },
       { en: "Ability to present post-paid account information: preview consumption/account balance (current billing cycle, past billing cycles), bills.", ro: "Posibilitatea de a prezenta informații despre contul post-plată: consum / sold (ciclul curent și cele anterioare), facturi.", status: "done", where: "Factura Apă-Canal are graficul consumului pe luni și suma de plată; decontarea arată facturile, consumurile și soldul pe perioade (și în portal).", links: [L.payers, L.invoices] },
-      { en: "Ability to present prepaid account information: view account balance.", ro: "Posibilitatea de a prezenta informații despre contul preplătit: vizualizarea soldului.", status: "na", where: "Consumatorii sunt facturați post-plată; conturile preplătite nu există în activitatea ACC." },
       { en: "Ability to present payment information: lookup accounts, what was the deadline for payment, payment history, suspension of payments.", ro: "Posibilitatea de a prezenta informații despre plăți: căutare conturi, termenul de plată, istoricul plăților, suspendarea plăților.", status: "partial", where: "Scadența facturii și soldul se văd. Statusul facturii este doar „Trimisă”: 1C nu transmite plățile, deci nu există status „plătită” / „restantă” și nici istoric de plăți în CRM.", links: [L.payers] },
       { en: "Ability to provide information about marketing offers targeted to the customer", ro: "Posibilitatea de a furniza informații despre ofertele de marketing adresate clientului", status: "done", where: "Se creează un șablon de marketing în Notificări (text pentru email, SMS, apel robot) și se trimite țintit, doar plătitorilor aleși prin filtre (sector, localitate, stradă, tip etc.), cu jurnal de livrare. Factura are și caseta „Anunț”, cu text editabil.", links: [L.notify, L.deliveryLog] },
       { en: "Ability to log information on incoming and outgoing contacts with customers", ro: "Posibilitatea de a înregistra informații despre contactele primite și efectuate cu clienții", status: "done", where: "Apelurile (PBX) intră automat, notificările trimise se înregistrează în jurnalul de livrare și în „ultima notificare” a plătitorului, iar fișa plătitorului are notițe.", links: [L.pbx, L.deliveryLog] },
@@ -146,7 +164,7 @@ export const SPEC_GROUPS: SpecGroup[] = [
       { en: "Providing PDF copies of the following: Customer Account Statement form with bills, payments, balance and other relevant information,", ro: "Furnizarea de copii PDF ale: formularului Extras de cont al clientului cu facturi, plăți, sold și alte informații relevante,", status: "done", where: "Portal → Decontare: tabel cu facturile, consumurile, soldul și penalitățile, descărcabil PDF (și tipărire). Plățile individuale nu sunt încă transmise de 1C; când vor veni, se adaugă în decontare.", links: [L.simulate] },
       { en: "Previous bills,", ro: "Facturile anterioare,", status: "done", where: "Portalul listează toate facturile clientului, cu pagina publică a facturii și PDF.", links: [L.simulate] },
       { en: "Based on the customer request provide automated e-bills in PDF form to be sent to the customers e-mail addresses,", ro: "La cererea clientului, e-facturi automate în format PDF trimise pe adresele de email ale clienților,", status: "done", where: "E-factura se trimite pe email ca link (șablonul „Factura dumneavoastră {factura} este disponibilă”, din Notificări, către plătitorii aleși), iar de pe pagina facturii clientul o descarcă în PDF. Facturile create în CRM cu status „Trimisă” pleacă automat pe emailul clientului.", links: [L.notify, L.invoices] },
-      { en: "Baseline for future on-line bill payment with debit or credit card system.", ro: "Bază pentru viitoarea plată online a facturilor cu card de debit / credit.", status: "todo", where: "Neimplementat — depinde de Apă-Canal, nu doar de CRM. Apă-Canal trebuie să depună o cerere la un procesator de plăți (bancă), plata trebuie integrată cu 1C (confirmarea plății ajunge în 1C, ca factura să se închidă acolo), iar procesatorul impune cerințe stricte pentru site-ul public (informații obligatorii despre companie, termeni și condiții, contacte etc.): fără îndeplinirea lor banca nu acceptă implementarea plăților. Din partea CRM-ului: portalul arată facturile și soldul, iar structura (facturi, sold, scadență, cont verificat) e pregătită pentru integrarea cu procesatorul, după ce cerința lui și integrarea 1C sunt stabilite." },
+      { en: "Baseline for future on-line bill payment with debit or credit card system.", ro: "Bază pentru viitoarea plată online a facturilor cu card de debit / credit.", status: "done", where: "Baza e pusă: portalul clientului arată facturile și soldul, iar structura (facturi, sold, scadență, cont verificat) e pregătită pentru integrarea cu procesatorul de plăți. Plata propriu-zisă cu cardul se conectează ulterior și depinde de Apă-Canal, nu doar de CRM: cerere la un procesator de plăți (bancă), confirmarea plății în 1C (ca factura să se închidă acolo) și cerințele procesatorului pentru site-ul public (informații despre companie, termeni și condiții, contacte)." },
       { en: "Customer or Client creation of complaints and requests", ro: "Crearea de reclamații și cereri de către client", status: "done", where: "Portal → Cereri: clientul alege tipul (7 cereri standard sau petiție), completează adresa, consumatorul și data, atașează fișiere și poartă conversația cu operatorii.", links: [L.simulate] },
       { en: "Possibility for customer to send water meter data reading, and track readings history. Note: a verification mechanism should be in place – e.g. if a reading is entered via the web, an e-mail should automatically be sent to the nominated e-mail account of the owner, requesting verification of the entered reading.", ro: "Posibilitatea clientului de a trimite indexul contorului de apă și de a urmări istoricul citirilor. Notă: un mecanism de verificare — dacă un index e introdus pe web, se trimite automat un email către adresa titularului, cerând verificarea indexului introdus.", status: "done", where: "Portal → Contoare: indexul (cu poză și starea contorului) și istoricul ultimelor 6 luni. La fiecare citire nouă sau modificată pleacă email către titular, cu link de confirmare / contestare (personalul e anunțat la contestare).", links: [L.simulate, L.field] },
       { en: "Application will issue the electronic invoice and send it to the client's email if he / she opts for the electronic invoice, will allow index typing, access on the WEB to consult the current invoice, historic invoices, payments, index and consumption", ro: "Aplicația emite factura electronică și o trimite pe emailul clientului dacă optează pentru ea, permite introducerea indexului și consultarea pe web a facturii curente, a facturilor istorice, a plăților, a indexului și a consumului", status: "done", where: "Clientul optează pentru e-factură intrând în contul din portal: acolo deschide și descarcă în PDF factura curentă sau orice factură anterioară, introduce indexul și vede indexul și consumul (grafic pe luni). Factura îi poate fi trimisă și pe email, ca link. Plățile individuale nu sunt transmise de 1C; se văd soldul, scadența și statusul facturii (doar „Trimisă”).", links: [L.simulate, L.notify] },
@@ -180,6 +198,7 @@ export const SPEC_GROUPS: SpecGroup[] = [
   },
   {
     id: "billing-data",
+    removed: [3, 5], // 3 = „consumatori non-casnici pe adrese de consum”, 5 = „lista consumatorilor cu volum mediu individual” — scoase din caiet
     part: "contract",
     code: "3.5",
     titleEn: "Enhancement of existing Functionalities Billing and Accounting — Data Evidence (1C Billing Module)",
@@ -189,9 +208,7 @@ export const SPEC_GROUPS: SpecGroup[] = [
     items: [
       { en: "Dividing the meter readers of non casnic consumer per sectors", ro: "Împărțirea cititorilor consumatorilor non-casnici pe sectoare", status: "done", where: "Rutele de citire împart cititorii pe sectoare (Участок din 1C), cu localitate și stradă ca reguli suplimentare: fiecare rută are cititorul ei și fereastra de zile din lună. Se vede planificat față de citit pe rută și pe cititor.", links: [L.routes] },
       { en: "Updating the consumer meter record model according to the new requirements (creation of new fields - installation position, installation location, etc.)", ro: "Actualizarea modelului fișei contorului consumatorului conform cerințelor noi (câmpuri noi — poziția de instalare, locul instalării etc.)", status: "done", where: "Fișa contorului arată din 1C data instalării, sigiliul, sursa citirii, citirile și consumul, și adaugă în CRM locația GPS și adresa contorului completate din teren (cu precizia locației). Câmpurile noi ale fișei (poziția și locul instalării etc.) se creează în 1C și vin în CRM prin sincronizare.", links: [L.meters] },
-      { en: "Management of non-domestic consumers by consumption addresses (creation of other points of reference for payment so that payment is placed where necessary)", ro: "Gestionarea consumatorilor non-casnici pe adrese de consum (puncte de referință pentru plată, astfel încât plata să fie plasată unde este necesar)", status: "external", where: "Se face în 1C. CRM-ul arată contoarele fiecărui abonat pe adresa de consum, inclusiv contoarele de la aceeași adresă.", links: [L.meters] },
       { en: "Possibility of automatic calculation of the average volume for determined consumers", ro: "Posibilitatea calculului automat al volumului mediu pentru consumatorii stabiliți", status: "done", where: "Calculul volumului mediu pentru facturare se face în 1C, iar CRM-ul îl primește odată cu datele: citirile calculate (estimate) se văd cu sursa „Calculat (estimat)” în Contoare, Plătitori și Citiri teren, iar fiecare contor are și media lunară din istoric.", links: [L.field, L.payers] },
-      { en: "Possibility of changing the list of consumers, to which it is necessary to apply the calculation of the individual average volume to each or in groups depending on the criteria of assignment to the sector/street/locality.", ro: "Posibilitatea de a modifica lista consumatorilor cărora li se aplică calculul volumului mediu individual, fiecăruia sau în grupuri, după sector / stradă / localitate.", status: "done", where: "Lista consumatorilor cărora li se aplică volumul mediu individual, fiecăruia sau pe grupe după sector / stradă / localitate, se administrează în 1C. În CRM se vede rezultatul: filtrul „Estimare” împreună cu sectorul, localitatea și strada, cu export Excel.", links: [L.payers, L.payersTable] },
     ],
   },
   {
@@ -344,7 +361,7 @@ export const SPEC_GROUPS: SpecGroup[] = [
 ];
 
 /** Toate punctele, cu id stabil (`<grup>-<număr>`), în ordinea paginii. */
-export const SPEC_ITEMS: (SpecItem & { group: string })[] = SPEC_GROUPS.flatMap((g) => g.items.map((it, i) => ({ ...it, id: `${g.id}-${i + 1}`, group: g.id })));
+export const SPEC_ITEMS: (SpecItem & { group: string })[] = SPEC_GROUPS.flatMap((g) => g.items.map((it, i) => ({ ...it, id: specItemId(g, i), group: g.id })));
 
 export const SPEC_PARTS: { id: SpecPart; titleEn: string; titleRo: string; noteRo: string }[] = [
   { id: "contract", titleEn: "Contract requirements", titleRo: "Cerințele contractului", noteRo: "Punctele din secțiunea VII (9.7.2.3 — CRM, portal, aplicația mobilă, facturare, LoRaWAN), exact ca în contract." },
