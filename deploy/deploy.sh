@@ -32,7 +32,7 @@ done
 [ -n "$(env_get NEXT_PUBLIC_APP_URL)" ] || echo "ATENȚIE: NEXT_PUBLIC_APP_URL e gol în .env (se coace la build: linkurile din emailuri și PWA ies greșit)."
 for c in git npm npx pm2 flock curl; do command -v "$c" >/dev/null || die "$c nu e instalat (pm2:  npm i -g pm2;  flock vine cu util-linux)."; done
 
-NAME=$(env_get PM2_NAME); NAME=${NAME:-crm}
+NAME=$(env_get PM2_NAME); NAME=${NAME:-crmLeova}
 PORT=$(env_get PORT); PORT=${PORT:-3000}
 BUILD_HEAP=$(env_get BUILD_HEAP_MB); BUILD_HEAP=${BUILD_HEAP:-4096}
 
