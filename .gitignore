@@ -61,3 +61,9 @@ public/maplibre-gl-worker.mjs
 /public/device_admin_table_axioma_w1_water_meters_list.xlsx
 /public/projects-*.xlsx
 /StefanPWA-main*.zip
+
+# pm2 / deploy automat (ecosystem.config.js, deploy/*.sh): jurnalele de pe server
+/logs/
+
+# .env.example se păstrează în repo (deploy.sh îți cere să-l copiezi), restul .env* rămân ignorate
+!.env.example

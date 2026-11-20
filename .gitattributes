@@ -1,0 +1,4 @@
+# Scripturile de deploy rulează pe Linux: mereu LF (CRLF strică bash)
+*.sh text eol=lf
+deploy/* text eol=lf
+ecosystem.config.js text eol=lf
